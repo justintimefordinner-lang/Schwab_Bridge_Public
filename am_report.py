@@ -847,6 +847,22 @@ def main(force: bool = False) -> None:
         if not active:
             report_path = os.path.join(data_dir, REPORT_FILE)
             if os.path.exists(report_path):
+                # Keep the last board (no Schwab calls), but refresh the market-status
+                # flags on it so the UI shows "Market closed" off-hours. Without this,
+                # meta.marketOpen stays True from the last trading-hours run and the
+                # closed badge never appears.
+                try:
+                    mopen, early = _market_status()
+                    with open(report_path, encoding="utf-8") as f:
+                        prev = json.load(f)
+                    meta = prev.setdefault("meta", {})
+                    if mopen is not None:
+                        meta["marketOpen"] = mopen
+                    meta["earlyClose"] = early
+                    with open(report_path, "w", encoding="utf-8") as f:
+                        json.dump(prev, f, indent=2)
+                except Exception as e:
+                    print("  (could not refresh market-status flags: %s)" % e)
                 print("Market %s — keeping the last board, skipping the pull "
                       "(use --force to run anyway)." % why)
                 return
