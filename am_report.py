@@ -399,6 +399,18 @@ def put_ladder(chain: dict, bands: dict | None = None) -> list[dict]:
     return legs
 
 
+def gate_ref(ladder: list[dict]) -> tuple[dict | None, bool]:
+    """The chain's gate reference: the closest-to-30Δ ladder strike (the ladder runs
+    30→15Δ) that is actually tradeable — OI ≥ oi_min AND spread ≤ spread_max. Returns
+    (leg, any_tradeable). If NO strike is liquid, returns (first leg, False) so the
+    caller can flag the whole chain untradeable."""
+    if not ladder:
+        return None, False
+    liquid = [L for L in ladder
+              if L["oi"] >= CONFIG["oi_min"] and L["spreadPct"] <= CONFIG["spread_max_pct"]]
+    return (liquid[0], True) if liquid else (ladder[0], False)
+
+
 def gamma_profile(chain: dict, spot: float | None) -> dict | None:
     """Naive dealer gamma: per strike, call gamma×OI is positive, put gamma×OI
     negative (standard 'dealers short customer puts' convention). Returns the
@@ -525,13 +537,13 @@ def screen(sym: str, candles: list[dict], spy: list[float], chain: dict | None,
 
     bands = bollinger(closes)
     ladder = put_ladder(chain, bands) if chain else []
-    put = ladder[0] if ladder else None   # 30Δ leg = the gate reference
+    put, tradeable = gate_ref(ladder)   # nearest-to-30Δ liquid strike = gate reference
     if not put:
         fails.append("no 30D/30Δ chain")
     else:
         if put["premPct"] < CONFIG["premium_floor_pct"]:
             fails.append("premium<%.1f%%" % CONFIG["premium_floor_pct"])
-        if put["oi"] < CONFIG["oi_min"] or put["spreadPct"] > CONFIG["spread_max_pct"]:
+        if not tradeable:   # not one of the ladder strikes met OI/spread minimums
             fails.append("untradeable chain")
 
     iv = atm_iv(chain, spot) if chain else None
@@ -811,7 +823,7 @@ def refresh_ladders(force: bool = False) -> int | None:
         if not ladder:
             continue
         row["ladder"] = ladder
-        row["chain"] = ladder[0]
+        row["chain"] = gate_ref(ladder)[0]
         # refresh VRP live: fresh ATM IV vs the realized vol from the last full run
         spot = chain.get("underlyingPrice")
         iv = atm_iv(chain, spot) if spot else None
