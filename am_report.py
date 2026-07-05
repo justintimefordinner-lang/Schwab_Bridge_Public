@@ -516,7 +516,12 @@ def screen(sym: str, candles: list[dict], spy: list[float], chain: dict | None,
     rv_vol = rel_vol(volumes_of(candles))
     fails = []
     if not tm["uptrend"]:
-        fails.append("no 1.5y uptrend")
+        if not tm["above200"]:
+            fails.append("Not above 200 day SMA")
+        elif not tm["rising200"]:
+            fails.append("200 day SMA not rising")
+        else:
+            fails.append("Negative 1.5y return")
 
     bands = bollinger(closes)
     ladder = put_ladder(chain, bands) if chain else []
