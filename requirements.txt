@@ -1,0 +1,6 @@
+streamlit>=1.50
+schwab-py>=1.5
+python-dotenv>=1.0
+pandas>=2.2
+gspread>=6.0
+gspread-dataframe>=4.0

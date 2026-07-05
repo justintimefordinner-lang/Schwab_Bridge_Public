@@ -1,0 +1,37 @@
+# ─── Secrets — never commit these ───────────────────────────────
+.env
+.env.*
+token.json
+tokens.json
+service_account.json
+service_account*.json
+client_secret*.json
+credentials*.json
+*.pem
+*.pickle
+*.pkl
+
+# ─── Committable templates (re-include these; must come after the rules above) ───
+!.env.example
+!*.example.json
+
+# ─── Logs / scratch ─────────────────────────────────────────────
+export_log.txt
+*.log
+
+# ─── Python ─────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# ─── Virtualenvs ────────────────────────────────────────────────
+.venv/
+.venv*
+venv/
+
+# ─── OS junk ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
