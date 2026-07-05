@@ -352,9 +352,9 @@ def _leg_from(c: dict, strike: float, delta: float) -> dict:
 
 
 def put_ladder(chain: dict, bands: dict | None = None) -> list[dict]:
-    """The ~30 / 25 / 20-delta puts in the near-monthly expiration, each with premium
+    """The ~30 / 25 / 20 / 15-delta puts in the near-monthly expiration, each with premium
     %, OI, spread, and annualized return (premPct × 365/DTE). Picks the strike whose
-    delta is closest to each target and forces three DISTINCT strikes, so the ladder
+    delta is closest to each target and forces four DISTINCT strikes, so the ladder
     can't collapse onto one contract when strikes are coarse or Schwab's per-strike
     deltas are sparse (it backfills those from IV). When `bands` (20-day Bollinger) is
     supplied, each leg also carries where its strike sits on that scale. First leg
@@ -382,7 +382,7 @@ def put_ladder(chain: dict, bands: dict | None = None) -> list[dict]:
 
     legs = []
     used: set[float] = set()
-    for dtarget in (0.30, 0.25, 0.20):
+    for dtarget in (0.30, 0.25, 0.20, 0.15):
         target = -dtarget
         pool = [t for t in cands if t[0] not in used] or cands  # keep strikes distinct
         strike, dl, c = min(pool, key=lambda t: abs(t[1] - target))
