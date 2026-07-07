@@ -496,11 +496,11 @@ def _load_order_store(data_dir: str) -> dict[str, list[dict[str, Any]]]:
 
 # --------------------------------------------------------------------------- covered calls
 # Covered-call premiums for held stock (>=100 shares): the ~30-delta call at the
-# expirations nearest 14 / 21 / 30 DTE, with premium % and annualized yield. Cached
-# per ticker with a short TTL and refreshed only in market hours, so the 60s app push
-# doesn't hammer Schwab option chains for every holding.
+# expirations nearest 1 / 2 / 3 / 4 weeks out, with premium % and annualized yield.
+# Cached per ticker with a short TTL and refreshed only in market hours, so the 60s app
+# push doesn't hammer Schwab option chains for every holding.
 COVERED_CALL_CACHE_FILE = "covered_calls.json"
-CC_TARGET_DTES = (14, 21, 30)
+CC_TARGET_DTES = (7, 14, 21, 28)
 CC_TARGET_DELTA = 0.30
 CC_TTL_SEC = 300  # re-pull a ticker's chain at most every ~5 minutes
 
@@ -612,7 +612,7 @@ def _covered_calls_for(sc, c, ticker: str, spot: float | None, cache: dict,
 
 def _enrich_covered_calls(sc, c, account_data: dict, cache: dict,
                           now_ts: float, market_open: bool) -> None:
-    """Attach coveredCalls (~30-delta / 14/21/30 DTE) and gamma walls to each holding
+    """Attach coveredCalls (~30-delta / 1-4 week tenors) and gamma walls to each holding
     of >=100 shares, computed off a single call+put chain fetch per ticker."""
     for e in account_data.get("equities", []):
         if (e.get("qty") or 0) >= 100 and e.get("price"):
