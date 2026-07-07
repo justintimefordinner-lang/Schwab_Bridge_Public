@@ -197,16 +197,23 @@ def _bands_for(sc, c, ticker: str, cache: dict, today_str: str) -> dict | None:
 
 
 def _enrich_bb(sc, c, account_data: dict, cache: dict, today_str: str) -> None:
-    """Tag every option leg with bbSigma (its strike vs the underlying's 20-day BBs).
-    For CSPs / covered calls the leg is the short strike; for spread legs the app
-    picks the short leg's value. Bands fetched once per unique underlying."""
+    """Tag every option leg AND every held stock with bbSigma — the strike (or the
+    stock's own price) vs the underlying's 20-day Bollinger bands. For CSPs / covered
+    calls the leg is the short strike; for spread legs the app picks the short leg's
+    value. Bands fetched once per unique underlying."""
     opts = account_data.get("options", [])
+    eqs = account_data.get("equities", [])
     syms = {o.get("symbol") for o in opts if o.get("symbol") and o.get("strike")}
+    syms |= {e.get("symbol") for e in eqs if e.get("symbol") and e.get("price")}
     bands_by_sym = {s: _bands_for(sc, c, s, cache, today_str) for s in syms}
     for o in opts:
         sig = _strike_sigma(o.get("strike"), bands_by_sym.get(o.get("symbol")))
         if sig is not None:
             o["bbSigma"] = sig
+    for e in eqs:
+        sig = _strike_sigma(e.get("price"), bands_by_sym.get(e.get("symbol")))
+        if sig is not None:
+            e["bbSigma"] = sig
 
 
 def get_option_greeks(c, option_symbols: list[str]) -> dict[str, dict[str, float]]:
@@ -570,30 +577,45 @@ def _covered_calls_from_chain(chain: dict, spot: float | None) -> list[dict] | N
 
 
 def _covered_calls_for(sc, c, ticker: str, spot: float | None, cache: dict,
-                       now_ts: float, market_open: bool) -> list[dict] | None:
+                       now_ts: float, market_open: bool) -> dict:
+    """Covered-call quotes AND gamma walls for a ticker, computed off ONE call+put
+    chain fetch. Returns {"cc": [...]|None, "gamma": {...}|None}, cached with a short
+    TTL and refreshed only in market hours."""
     ent = cache.get(ticker) or {}
     fresh = ent.get("ts") is not None and (now_ts - ent["ts"]) < CC_TTL_SEC
-    if fresh or (not market_open and ent.get("cc") is not None):
-        return ent.get("cc")
+    if fresh or (not market_open and (ent.get("cc") is not None or ent.get("gamma") is not None)):
+        return ent
     try:
         chain = sc.get_option_chain(c, ticker, days=40, strike_count=60, puts_only=False)
     except Exception:
-        return ent.get("cc")
-    cc = _covered_calls_from_chain(chain, spot) if chain else None
-    if cc is not None:                       # never cache a None over good data
-        cache[ticker] = {"ts": now_ts, "cc": cc}
-        return cc
-    return ent.get("cc")
+        return ent
+    if not chain:
+        return ent
+    from am_report import gamma_profile
+    cc = _covered_calls_from_chain(chain, spot)
+    gam = gamma_profile(chain, spot)
+    if cc is None and gam is None:           # bad pull — keep whatever we had cached
+        return ent
+    upd = {
+        "ts": now_ts,
+        "cc": cc if cc is not None else ent.get("cc"),
+        "gamma": gam if gam is not None else ent.get("gamma"),
+    }
+    cache[ticker] = upd
+    return upd
 
 
 def _enrich_covered_calls(sc, c, account_data: dict, cache: dict,
                           now_ts: float, market_open: bool) -> None:
-    """Attach coveredCalls to each holding of >=100 shares (one contract minimum)."""
+    """Attach coveredCalls (~30-delta / 14/21/30 DTE) and gamma walls to each holding
+    of >=100 shares, computed off a single call+put chain fetch per ticker."""
     for e in account_data.get("equities", []):
         if (e.get("qty") or 0) >= 100 and e.get("price"):
-            cc = _covered_calls_for(sc, c, e["symbol"], e.get("price"), cache, now_ts, market_open)
-            if cc:
-                e["coveredCalls"] = cc
+            res = _covered_calls_for(sc, c, e["symbol"], e.get("price"), cache, now_ts, market_open)
+            if res.get("cc"):
+                e["coveredCalls"] = res["cc"]
+            if res.get("gamma"):
+                e["gamma"] = res["gamma"]
 
 
 def main() -> None:
