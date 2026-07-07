@@ -814,7 +814,7 @@ def refresh_ladders(force: bool = False) -> int | None:
     updated = 0
     throttle = CONFIG["ladder_throttle_sec"]
     for row in board:
-        chain = sc.get_option_chain(c, row["sym"], days=45, strike_count=25, puts_only=True)
+        chain = sc.get_option_chain(c, row["sym"], days=45, strike_count=100, puts_only=True)
         if throttle:
             time.sleep(throttle)   # space the calls so a tight cadence doesn't trip the limiter
         if not chain:
@@ -917,7 +917,7 @@ def main(force: bool = False) -> None:
         if not candles:
             continue
         spot = closes_of(candles)[-1] if candles else None
-        chain = sc.get_option_chain(c, sym)
+        chain = sc.get_option_chain(c, sym, strike_count=100)
         row = screen(sym, candles, spy, chain, spot, earnings, iv_hist.get(sym, []), today)
         rows.append(row)
         _log_iv(iv_hist, sym, row.get("iv"), day_str)   # accumulate IV for IVR
