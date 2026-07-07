@@ -482,6 +482,120 @@ def _load_order_store(data_dir: str) -> dict[str, list[dict[str, Any]]]:
         return {}
 
 
+# --------------------------------------------------------------------------- covered calls
+# Covered-call premiums for held stock (>=100 shares): the ~30-delta call at the
+# expirations nearest 14 / 21 / 30 DTE, with premium % and annualized yield. Cached
+# per ticker with a short TTL and refreshed only in market hours, so the 60s app push
+# doesn't hammer Schwab option chains for every holding.
+COVERED_CALL_CACHE_FILE = "covered_calls.json"
+CC_TARGET_DTES = (14, 21, 30)
+CC_TARGET_DELTA = 0.30
+CC_TTL_SEC = 300  # re-pull a ticker's chain at most every ~5 minutes
+
+
+def _cc_market_open() -> bool:
+    """Rough US equity market-hours gate (weekday, 9:30-16:00 ET). Ignores holidays —
+    on one it just serves cached premiums a little longer. Assumes open if the timezone
+    can't be resolved, so we still refresh rather than go stale forever."""
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        return True
+    if now.weekday() >= 5:
+        return False
+    mins = now.hour * 60 + now.minute
+    return 570 <= mins < 960  # 9:30 AM .. 4:00 PM ET
+
+
+def _call_delta(row: dict) -> float | None:
+    """A call's delta from Schwab's per-contract value; None when blank (-999)."""
+    dl = row.get("delta")
+    if dl is None:
+        return None
+    try:
+        dl = float(dl)
+    except (TypeError, ValueError):
+        return None
+    return dl if 0.0 < dl <= 1.0 else None
+
+
+def _covered_calls_from_chain(chain: dict, spot: float | None) -> list[dict] | None:
+    """The ~30-delta call at the expirations nearest each target DTE, with premium
+    per share, premium % of spot, and annualized yield. Distinct expirations."""
+    if not chain or not spot:
+        return None
+    cmap = chain.get("callExpDateMap") or {}
+    exps: list[tuple[int, str]] = []
+    for key in cmap:
+        try:
+            exps.append((int(key.split(":")[1]), key))
+        except (IndexError, ValueError):
+            continue
+    if not exps:
+        return None
+    out: list[dict] = []
+    used: set[str] = set()
+    for target in CC_TARGET_DTES:
+        pool = [e for e in exps if e[1] not in used] or exps
+        dte, key = min(pool, key=lambda e: abs(e[0] - target))
+        used.add(key)
+        best = None
+        for strike_s, lst in cmap[key].items():
+            row = lst[0]
+            dl = _call_delta(row)
+            if dl is None:
+                continue
+            diff = abs(dl - CC_TARGET_DELTA)
+            if best is None or diff < best[0]:
+                best = (diff, float(strike_s), dl, row)
+        if best is None:
+            continue
+        _, strike, dl, row = best
+        mark = row.get("mark")
+        if mark is None:
+            mark = ((row.get("bid") or 0.0) + (row.get("ask") or 0.0)) / 2
+        prem_pct = (mark / spot * 100) if spot else 0.0
+        out.append({
+            "targetDte": target,
+            "dte": dte,
+            "strike": _round(strike),
+            "delta": _round(dl),
+            "mark": _round(mark),
+            "premPct": _round(prem_pct),
+            "annPct": round(prem_pct * 365 / dte, 1) if dte > 0 else None,
+            "oi": int(row.get("openInterest") or 0),
+        })
+    return out or None
+
+
+def _covered_calls_for(sc, c, ticker: str, spot: float | None, cache: dict,
+                       now_ts: float, market_open: bool) -> list[dict] | None:
+    ent = cache.get(ticker) or {}
+    fresh = ent.get("ts") is not None and (now_ts - ent["ts"]) < CC_TTL_SEC
+    if fresh or (not market_open and ent.get("cc") is not None):
+        return ent.get("cc")
+    try:
+        chain = sc.get_option_chain(c, ticker, days=40, strike_count=60, puts_only=False)
+    except Exception:
+        return ent.get("cc")
+    cc = _covered_calls_from_chain(chain, spot) if chain else None
+    if cc is not None:                       # never cache a None over good data
+        cache[ticker] = {"ts": now_ts, "cc": cc}
+        return cc
+    return ent.get("cc")
+
+
+def _enrich_covered_calls(sc, c, account_data: dict, cache: dict,
+                          now_ts: float, market_open: bool) -> None:
+    """Attach coveredCalls to each holding of >=100 shares (one contract minimum)."""
+    for e in account_data.get("equities", []):
+        if (e.get("qty") or 0) >= 100 and e.get("price"):
+            cc = _covered_calls_for(sc, c, e["symbol"], e.get("price"), cache, now_ts, market_open)
+            if cc:
+                e["coveredCalls"] = cc
+
+
 def main() -> None:
     # Lazy import so the pure mapping above can be tested without schwab-py.
     from dotenv import load_dotenv
@@ -508,6 +622,13 @@ def main() -> None:
             bb_cache = json.load(f)
     except Exception:
         bb_cache = {}
+    try:
+        with open(os.path.join(data_dir, COVERED_CALL_CACHE_FILE), encoding="utf-8") as f:
+            cc_cache = json.load(f)
+    except Exception:
+        cc_cache = {}
+    cc_now = datetime.now().timestamp()
+    cc_market_open = _cc_market_open()
 
     for i, acct in enumerate(accounts):
         acct_id = acct["hash"]                       # opaque, unique, app key
@@ -552,6 +673,7 @@ def main() -> None:
         })
         data_by_account[acct_id] = build_account_data(snap, greeks, points, open_dates, stock_day)
         _enrich_bb(sc, c, data_by_account[acct_id], bb_cache, today)
+        _enrich_covered_calls(sc, c, data_by_account[acct_id], cc_cache, cc_now, cc_market_open)
 
         # Opt-in sanity dump: set SIMULATE_DEBUG=1 to print, per leg, the full Simulate
         # chain — both underlying-close references (the option feed's underlyingPrice vs
@@ -583,6 +705,11 @@ def main() -> None:
     try:
         with open(os.path.join(data_dir, BB_CACHE_FILE), "w", encoding="utf-8") as f:
             json.dump(bb_cache, f)
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(data_dir, COVERED_CALL_CACHE_FILE), "w", encoding="utf-8") as f:
+            json.dump(cc_cache, f)
     except Exception:
         pass
 
