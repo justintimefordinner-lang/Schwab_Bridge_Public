@@ -428,12 +428,17 @@ def build_snapshot(
     app_accounts: list[dict[str, Any]],
     data_by_account: dict[str, dict[str, Any]],
     prices_as_of: str,
+    covered_calls_next_at: str | None = None,
 ) -> dict[str, Any]:
     return {
         "meta": {
             "generatedAt": datetime.now(timezone.utc).isoformat(),
             "pricesAsOf": prices_as_of,
             "source": SOURCE_LABEL,
+            # When the covered-call ladders next refresh (last fetch + TTL), so the app
+            # can show a live countdown next to Holdings. None off-hours (no refresh
+            # is scheduled until the market reopens).
+            "coveredCallsNextAt": covered_calls_next_at,
         },
         "accounts": app_accounts,
         "data": data_by_account,
@@ -740,7 +745,19 @@ def main() -> None:
     except Exception:
         pass
 
-    snapshot = build_snapshot(app_accounts, data_by_account, prices_as_of)
+    # Countdown target for the app: the covered-call ladders next refresh one TTL after
+    # their most recent fetch. Only meaningful while the market is open — off-hours the
+    # cache is served as-is with no refresh scheduled, so leave it None (no timer shown).
+    cc_next_at: str | None = None
+    if cc_market_open:
+        latest_ts = max(
+            (v["ts"] for v in cc_cache.values() if isinstance(v, dict) and v.get("ts")),
+            default=None,
+        )
+        if latest_ts:
+            cc_next_at = datetime.fromtimestamp(latest_ts + CC_TTL_SEC, timezone.utc).isoformat()
+
+    snapshot = build_snapshot(app_accounts, data_by_account, prices_as_of, cc_next_at)
 
     out_path = os.path.join(data_dir, SNAPSHOT_FILE)
     with open(out_path, "w", encoding="utf-8") as f:
