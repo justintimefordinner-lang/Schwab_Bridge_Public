@@ -36,6 +36,8 @@ SOURCE = "schwab"
 CONFIG = {
     "dte_target": 30,
     "dte_window": (25, 45),
+    "monthly_max_dte": 38,      # if the nearest standard monthly is farther out than
+                                # this, fall back to the weekly closest to 30 DTE instead
     "trade_delta": 0.30,
     "premium_floor_pct": 1.5,   # hard gate: min % return at ~30Δ / ~30DTE
     "oi_min": 50,               # tradeability sanity
@@ -315,9 +317,16 @@ def _near_monthly_exp(exp_map: dict) -> str | None:
             cands.append((key, dte, ed))
     if not cands:
         return None
+    nearest = lambda pool: min(pool, key=lambda c: abs(c[1] - CONFIG["dte_target"]))
+    # Prefer the standard third-Friday monthly (deepest liquidity) closest to the target,
+    # but if that monthly is farther out than monthly_max_dte, take the weekly nearest 30
+    # DTE instead — keeps the ladder from drifting to ~45 DTE early in the month.
     monthlies = [c for c in cands if c[2].weekday() == 4 and 15 <= c[2].day <= 21]
-    pool = monthlies if monthlies else cands
-    return min(pool, key=lambda c: abs(c[1] - CONFIG["dte_target"]))[0]
+    if monthlies:
+        best_monthly = nearest(monthlies)
+        if best_monthly[1] <= CONFIG["monthly_max_dte"]:
+            return best_monthly[0]
+    return nearest(cands)[0]
 
 
 def _norm_cdf(x: float) -> float:
