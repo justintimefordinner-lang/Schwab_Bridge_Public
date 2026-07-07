@@ -211,9 +211,14 @@ def _enrich_bb(sc, c, account_data: dict, cache: dict, today_str: str) -> None:
         if sig is not None:
             o["bbSigma"] = sig
     for e in eqs:
-        sig = _strike_sigma(e.get("price"), bands_by_sym.get(e.get("symbol")))
+        bands = bands_by_sym.get(e.get("symbol"))
+        sig = _strike_sigma(e.get("price"), bands)
         if sig is not None:
             e["bbSigma"] = sig
+        for cc in e.get("coveredCalls") or []:
+            csig = _strike_sigma(cc.get("strike"), bands)
+            if csig is not None:
+                cc["bbSigma"] = csig
 
 
 def get_option_greeks(c, option_symbols: list[str]) -> dict[str, dict[str, float]]:
@@ -694,8 +699,8 @@ def main() -> None:
             "isDefault": i == 0,
         })
         data_by_account[acct_id] = build_account_data(snap, greeks, points, open_dates, stock_day)
-        _enrich_bb(sc, c, data_by_account[acct_id], bb_cache, today)
         _enrich_covered_calls(sc, c, data_by_account[acct_id], cc_cache, cc_now, cc_market_open)
+        _enrich_bb(sc, c, data_by_account[acct_id], bb_cache, today)
 
         # Opt-in sanity dump: set SIMULATE_DEBUG=1 to print, per leg, the full Simulate
         # chain — both underlying-close references (the option feed's underlyingPrice vs
