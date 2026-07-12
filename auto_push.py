@@ -99,6 +99,34 @@ def _run(label: str, fn) -> tuple[float, object]:
     return time.time() - start, result
 
 
+_ENV_KEY_FOR_LABEL = {
+    "app": "APP_PUSH_INTERVAL",
+    "sheets": "SHEETS_PUSH_INTERVAL",
+    "history": "HISTORY_PUSH_INTERVAL",
+    "research": "RESEARCH_PUSH_INTERVAL",
+    "am_report": "AM_REPORT_PUSH_INTERVAL",
+    "am_ladder": "AM_LADDER_PUSH_INTERVAL",
+}
+
+
+def _reload_intervals(targets):
+    """Re-read *_PUSH_INTERVAL from .env each tick and apply any change to
+    already-running targets, so interval edits from the app's Settings page
+    take effect without restarting this process. Only targets enabled at
+    startup (interval > 0) are adjusted; flipping a target 0<->nonzero still
+    needs a restart. A changed interval takes effect on that target's next
+    scheduled run (next_run is intentionally left alone)."""
+    load_dotenv(override=True)
+    for t in targets:
+        env_key = _ENV_KEY_FOR_LABEL.get(t[0])
+        if not env_key:
+            continue
+        new_interval = _interval(env_key, t[2])
+        if new_interval > 0 and new_interval != t[2]:
+            _log(f"{t[0]}: interval changed {t[2]}s -> {new_interval}s (picked up from .env)")
+            t[2] = new_interval
+
+
 def main() -> None:
     app_interval = _interval("APP_PUSH_INTERVAL", 60)
     sheets_interval = _interval("SHEETS_PUSH_INTERVAL", 300)
@@ -172,6 +200,7 @@ def main() -> None:
         while True:
             now = time.time()
             ran_any = False
+            _reload_intervals(targets)
 
             # Daily post-open forced run (e.g. 9:40 ET). Fires once per trading day
             # within the catch window. _run_window() is active only on trading days
