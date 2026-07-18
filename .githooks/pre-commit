@@ -1,0 +1,59 @@
+#!/bin/sh
+# ---------------------------------------------------------------------------
+# Secret guard — blocks commits that add credential files or secret-looking
+# values. Dependency-free (pure shell), so it works the moment you enable it:
+#
+#     git config core.hooksPath .githooks
+#
+# For a heavier, industry-standard scan, also install pre-commit + gitleaks
+# (see .pre-commit-config.yaml). This hook is the always-on backstop.
+#
+# Bypass (only if you are CERTAIN it is a false positive):
+#     git commit --no-verify
+# ---------------------------------------------------------------------------
+set -eu
+
+fail=0
+
+# 1) Refuse credential / secret filenames (staged additions & modifications).
+staged=$(git diff --cached --name-only --diff-filter=AM || true)
+denied=$(printf '%s\n' "$staged" \
+  | grep -iE '(^|/)(\.env|\.env\..+|credentials\.env|tokens?\.json|service_account.*\.json|.*\.pem|.*\.pfx|.*\.p12|.*\.pickle|.*\.pkl|.*\.key|\.auth_state\.json)$|(^|/)reauth_inbox/' \
+  | grep -viE '\.example$' || true)
+if [ -n "$denied" ]; then
+  echo "BLOCKED: refusing to commit credential/secret files:" >&2
+  printf '  - %s\n' $denied >&2
+  fail=1
+fi
+
+# 2) Scan ADDED lines for secret-looking values. Patterns require a real,
+#    long value so template code like SCHWAB_APP_SECRET=${appSecret} and
+#    placeholders like =Enter Here / =your_app_key_here do NOT trip it.
+added=$(git diff --cached --unified=0 -- . 2>/dev/null | grep -E '^\+' | grep -vE '^\+\+\+' || true)
+hits=$(printf '%s\n' "$added" | grep -nE -e \
+  '-----BEGIN [A-Z ]*PRIVATE KEY-----|SCHWAB_API_KEY[[:space:]]*=[[:space:]]*[A-Za-z0-9]{16,}|SCHWAB_APP_SECRET[[:space:]]*=[[:space:]]*[A-Za-z0-9]{16,}|ROBINHOOD_PASSWORD[[:space:]]*=[[:space:]]*[^${}[:space:]]{6,}|ROBINHOOD_TOTP_SECRET[[:space:]]*=[[:space:]]*[A-Z2-7]{16,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,}' \
+  || true)
+if [ -n "$hits" ]; then
+  echo "BLOCKED: a staged change looks like a secret:" >&2
+  printf '  %s\n' "$hits" >&2
+  fail=1
+fi
+
+# 3) If gitleaks is installed, run it too as an extra net (best-effort across
+#    CLI versions; a real finding exits non-zero and blocks the commit).
+if command -v gitleaks >/dev/null 2>&1; then
+  if ! gitleaks git --staged --redact --no-banner >/dev/null 2>&1 \
+     && ! gitleaks protect --staged --redact --no-banner >/dev/null 2>&1; then
+    echo "BLOCKED: gitleaks reported a potential secret. Run:" >&2
+    echo "  gitleaks git --staged --redact   (or: gitleaks protect --staged)" >&2
+    fail=1
+  fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo "" >&2
+  echo "Commit blocked by .githooks/pre-commit. If truly a false positive:" >&2
+  echo "  git commit --no-verify" >&2
+  exit 1
+fi
+exit 0

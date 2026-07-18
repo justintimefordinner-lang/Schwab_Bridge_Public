@@ -1,0 +1,12 @@
+# Optional heavier secret scan using gitleaks, on top of the always-on
+# .githooks/pre-commit guard. To enable it:
+#
+#   pipx install pre-commit      # or: pip install pre-commit
+#   pre-commit install           # installs the git hook that runs gitleaks
+#
+# (Bump `rev` to the latest gitleaks release when you set this up.)
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks

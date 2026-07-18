@@ -128,5 +128,9 @@ browser and copy the fresh `token.json` over, then restart the service.)
   them back; `.env` holds only non-secret config and refresh intervals.
 - Copy `.env.example` → `.env` for that config. The `.example` files are
   placeholders and safe to commit.
+- **Commit-time secret guard:** a dependency-free `.githooks/pre-commit` (plus a
+  gitleaks `.pre-commit-config.yaml`) blocks accidental commits of credential
+  files or secret-looking values. After cloning, turn it on with
+  `git config core.hooksPath .githooks`.
 - Trade execution is intentionally **not** in this codebase. If you add it
   later, keep it in a separate module so this read-only surface stays small.
