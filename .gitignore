@@ -3,8 +3,6 @@
 .env.*
 token.json
 tokens.json
-service_account.json
-service_account*.json
 client_secret*.json
 credentials*.json
 *.pem
@@ -13,7 +11,6 @@ credentials*.json
 
 # ─── Committable templates (re-include these; must come after the rules above) ───
 !.env.example
-!*.example.json
 
 # ─── Logs / scratch ─────────────────────────────────────────────
 export_log.txt

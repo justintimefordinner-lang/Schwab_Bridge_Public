@@ -2,11 +2,10 @@
 
 A small Python bridge that pulls balances, positions, options, and order
 history from a Charles Schwab brokerage account and writes them as JSON for a
-dashboard front-end to render — and optionally mirrors the same data to a
-Google Sheet. **Read-only: it never places or cancels trades.**
+dashboard front-end to render. **Read-only: it never places or cancels trades.**
 
 `auto_push.py` runs on a loop (default every 60s) and keeps the dashboard's
-`data/` folder and your Google Sheet current. It's built to run continuously —
+`data/` folder current. It's built to run continuously —
 for example as a `systemd` service on a Raspberry Pi.
 
 ## One-time setup
@@ -43,19 +42,7 @@ Then edit `.env`:
 - Set **`APP_DATA_DIR`** to the absolute path of your dashboard app's `data/`
   folder (this is where the JSON snapshots are written).
 
-### 4. (Optional) Google Sheets mirror
-
-Only needed if you want `export_to_sheets.py` to update a Google Sheet:
-
-1. In Google Cloud, create a **service account** and enable the **Google Sheets API**.
-2. Download its JSON key, save it as `service_account.json`
-   (see `service_account.example.json` for the expected shape).
-3. **Share your target Sheet** with the service account's `client_email`.
-4. Put the Sheet's ID in `GOOGLE_SHEET_ID` in `.env`.
-
-Skip this entirely if you don't use Sheets — the dashboard push works without it.
-
-### 5. Authenticate
+### 4. Authenticate
 
 ```bash
 python auth_setup.py
@@ -71,8 +58,8 @@ proceed past it. A `token.json` file is written on success.
 python auto_push.py
 ```
 
-This runs the push loop that feeds the dashboard's `data/` folder (and the
-Google Sheet, if configured). To run it 24/7, wrap it in a service manager
+This runs the push loop that feeds the dashboard's `data/` folder. To run it
+24/7, wrap it in a service manager
 (`systemd`, `pm2`, etc.) pointed at `.venv/bin/python auto_push.py` with this
 folder as the working directory.
 
@@ -93,19 +80,17 @@ fresh `token.json` over, then restart the service.)
 | File                    | Role                                                     |
 |-------------------------|----------------------------------------------------------|
 | `auth_setup.py`         | Interactive Schwab login; writes `token.json`            |
-| `auto_push.py`          | Main loop — pushes data to the dashboard + Google Sheets |
+| `auto_push.py`          | Main loop — pushes data to the dashboard                 |
 | `schwab_client.py`      | Read-only Schwab data layer (balances, positions, orders)|
 | `export_to_app.py`      | Writes the dashboard JSON snapshot                       |
-| `export_to_sheets.py`   | Writes the Google Sheet                                  |
 | `sync_trade_history.py` | Builds trade / transaction history                       |
 | `app.py`                | Optional standalone Streamlit view                       |
 
 ## Security notes
 
-- **Never commit** `token.json`, `.env`, or `service_account.json` — they hold
-  live API credentials. They're already in `.gitignore`; keep them there.
-- Copy `.env.example` → `.env` and `service_account.example.json` →
-  `service_account.json` and fill in your own values. The `.example` files are
-  placeholders and safe to commit.
+- **Never commit** `token.json` or `.env` — they hold live API credentials.
+  They're already in `.gitignore`; keep them there.
+- Copy `.env.example` → `.env` and fill in your own values. `.env.example` is a
+  placeholder and safe to commit.
 - Trade execution is intentionally **not** in this codebase. If you add it
   later, keep it in a separate module so this read-only surface stays small.

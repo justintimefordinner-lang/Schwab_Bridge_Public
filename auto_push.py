@@ -7,10 +7,6 @@ never have to re-run an export by hand.
 
 Each cycle pulls READ-ONLY from Schwab (reusing schwab_client) and pushes to:
   - the Next.js app  ->  export_to_app.main()     (writes data/snapshot.json)
-  - Google Sheets    ->  export_to_sheets.main()  (optional)
-
-The two targets keep independent cadences, so you can refresh the app often
-while writing to Sheets less frequently (Sheets has tighter API quotas).
 
 Run with:
     python auto_push.py
@@ -20,7 +16,6 @@ depend on the Streamlit dashboard being open.
 
 .env knobs (all optional):
     APP_PUSH_INTERVAL=60        # seconds between app pushes   (0 = disable)
-    SHEETS_PUSH_INTERVAL=300    # seconds between Sheets pushes (0 = disable)
     AM_POST_OPEN_TIME=09:40     # ET HH:MM — one forced full am_report run after the
                                 # open settles (live premiums/greeks/OI). Empty = off.
     AM_POST_OPEN_GRACE_MIN=30   # catch window after that time (so a late start still fires)
@@ -101,7 +96,6 @@ def _run(label: str, fn) -> tuple[float, object]:
 
 _ENV_KEY_FOR_LABEL = {
     "app": "APP_PUSH_INTERVAL",
-    "sheets": "SHEETS_PUSH_INTERVAL",
     "history": "HISTORY_PUSH_INTERVAL",
     "research": "RESEARCH_PUSH_INTERVAL",
     "am_report": "AM_REPORT_PUSH_INTERVAL",
@@ -129,7 +123,6 @@ def _reload_intervals(targets):
 
 def main() -> None:
     app_interval = _interval("APP_PUSH_INTERVAL", 60)
-    sheets_interval = _interval("SHEETS_PUSH_INTERVAL", 300)
     history_interval = _interval("HISTORY_PUSH_INTERVAL", 60)
     research_interval = _interval("RESEARCH_PUSH_INTERVAL", 900)
     am_report_interval = _interval("AM_REPORT_PUSH_INTERVAL", 1800)
@@ -161,16 +154,10 @@ def main() -> None:
         # (puts-only chains, no candles/trend/gamma). Cheap enough for a few minutes.
         import am_report as _amr
         targets.append(["am_ladder", _amr.refresh_ladders, am_ladder_interval, 0.0])
-    if sheets_interval > 0:
-        try:
-            import export_to_sheets
-            targets.append(["sheets", export_to_sheets.main, sheets_interval, 0.0])
-        except Exception as exc:
-            _log(f"sheets: disabled (could not import: {exc})")
 
     if not targets:
         raise SystemExit(
-            "Nothing to push. Set APP_PUSH_INTERVAL and/or SHEETS_PUSH_INTERVAL > 0."
+            "Nothing to push. Set at least one *_PUSH_INTERVAL > 0."
         )
 
     # Daily post-open full run: pin ONE fresh, fully-live board right after the open
