@@ -246,21 +246,26 @@ def process_inbox() -> None:
             _write_status(configured=True, authStatus="error", authorizationUrl=None, error=_friendly(exc))
         return
 
-    # 3) idle — expire a stale pending login; otherwise just keep
-    #    configured/hasToken current (the change-detector avoids churn).
+    # 3) idle — expire a stale pending login; otherwise reflect reality.
+    #    "connected" vs "needs_login" is owned by note_app_pull (real pulls);
+    #    here we only assert needs_setup when there are no credentials, and
+    #    otherwise leave that badge alone (the change-detector avoids churn).
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, encoding="utf-8") as f:
                 saved = json.load(f)
             if time.time() - saved.get("created_at", 0) > AWAITING_TTL:
                 _clear_state()
-                _write_status(configured=configured, authStatus="needs_login",
+                _write_status(configured=configured,
+                              authStatus=("needs_login" if configured else "needs_setup"),
                               authorizationUrl=None, error="Login link expired — start again.")
             else:
                 _write_status(configured=configured, authStatus="awaiting_login",
                               authorizationUrl=saved.get("authorization_url"))
         except OSError:
             _write_status(configured=configured)
+    elif not configured:
+        _write_status(configured=False, authStatus="needs_setup", authorizationUrl=None, error=None)
     else:
         _write_status(configured=configured)
 
@@ -270,6 +275,11 @@ def note_app_pull(ok: bool, err: Exception | None = None) -> None:
     needs-login badge stays honest without any extra API calls. Never stomps an
     in-progress login."""
     if os.path.exists(STATE_FILE) or os.path.exists(START_MARKER) or os.path.exists(REDIRECT_FILE):
+        return
+    api_key, app_secret, _ = _load_creds()
+    if not (api_key and app_secret):
+        # No credentials on file -> first-run setup, regardless of any stale token.
+        _write_status(configured=False, authStatus="needs_setup", authorizationUrl=None, error=None)
         return
     if ok:
         _write_status(configured=True, authStatus="connected", authorizationUrl=None, error=None)
