@@ -34,6 +34,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# App-driven, write-only re-authentication (dashboard Settings page drops
+# requests into reauth_inbox/; this handles them). Optional by design: the
+# push loop must keep running even if this module can't be imported.
+try:
+    import reauth
+except Exception as _reauth_exc:  # noqa: BLE001
+    reauth = None
+    print(f"[auto_push] reauth unavailable: {_reauth_exc}", flush=True)
+
 try:
     from zoneinfo import ZoneInfo
     _ET = ZoneInfo("America/New_York")
@@ -78,6 +87,11 @@ def _log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+# Last outcome per target label: (ok: bool, exc: Exception | None). Used to
+# keep the re-auth "connected / needs-login" badge honest.
+_LAST_RUN: dict = {}
+
+
 def _run(label: str, fn) -> tuple[float, object]:
     """Run one export. Never raises — a failure in one target must not stop
     the loop or block the other target. Returns (elapsed seconds, fn result)."""
@@ -85,11 +99,14 @@ def _run(label: str, fn) -> tuple[float, object]:
     result = None
     try:
         result = fn()
+        _LAST_RUN[label] = (True, None)
         _log(f"{label}: ok ({time.time() - start:.1f}s)")
     except SystemExit as exc:
         # Export mains raise SystemExit on config problems (missing env, etc.).
+        _LAST_RUN[label] = (False, exc)
         _log(f"{label}: skipped — {exc}")
     except Exception as exc:  # e.g. AuthError when the token needs a refresh
+        _LAST_RUN[label] = (False, exc)
         _log(f"{label}: ERROR — {exc}")
     return time.time() - start, result
 
@@ -182,12 +199,24 @@ def main() -> None:
         + ", ".join(f"{t[0]} every {t[2]}s" for t in targets)
         + ". Press Ctrl+C to stop."
     )
+    if reauth is not None:
+        try:
+            reauth.init_status()
+        except Exception as exc:  # noqa: BLE001
+            _log(f"reauth: init status failed — {exc}")
     status: dict = {}
     try:
         while True:
             now = time.time()
             ran_any = False
             _reload_intervals(targets)
+
+            # Service any write-only re-auth request the app dropped in the inbox.
+            if reauth is not None:
+                try:
+                    reauth.process_inbox()
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"reauth: inbox error — {exc}")
 
             # Daily post-open forced run (e.g. 9:40 ET). Fires once per trading day
             # within the catch window. _run_window() is active only on trading days
@@ -214,6 +243,12 @@ def main() -> None:
                 if now >= next_run:
                     elapsed, result = _run(label, fn)
                     ran_any = True
+                    if label == "app" and reauth is not None:
+                        _ok, _exc = _LAST_RUN.get("app", (False, None))
+                        try:
+                            reauth.note_app_pull(_ok, _exc)
+                        except Exception:  # noqa: BLE001
+                            pass
                     if elapsed > interval:
                         _log(
                             f"{label}: warning — took {elapsed:.0f}s, longer than its "

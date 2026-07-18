@@ -1,6 +1,8 @@
 # ─── Secrets — never commit these ───────────────────────────────
 .env
 .env.*
+credentials.env
+credentials.env.*
 token.json
 tokens.json
 client_secret*.json
@@ -9,8 +11,13 @@ credentials*.json
 *.pickle
 *.pkl
 
+# ─── Re-auth (write-only) transient files — never commit ────────
+.auth_state.json
+reauth_inbox/
+
 # ─── Committable templates (re-include these; must come after the rules above) ───
 !.env.example
+!credentials.env.example
 
 # ─── Logs / scratch ─────────────────────────────────────────────
 export_log.txt

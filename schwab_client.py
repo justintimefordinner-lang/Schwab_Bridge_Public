@@ -44,22 +44,35 @@ def get_client() -> client.Client:
     """Build a client from the cached token file.
 
     Does NOT trigger an interactive login. If the token is missing or
-    expired, raises AuthError telling you to run auth_setup.py.
+    expired, raises AuthError.
+
+    Credentials are re-read on every call (base config from .env, App
+    Key/Secret from credentials.env if present) so a long-running bridge
+    picks up first-run credentials saved from the dashboard without a
+    restart.
     """
-    if not _API_KEY or not _APP_SECRET:
+    load_dotenv(".env")
+    load_dotenv(os.environ.get("SCHWAB_CREDENTIALS_PATH", "credentials.env"), override=True)
+    api_key = os.environ.get("SCHWAB_API_KEY")
+    app_secret = os.environ.get("SCHWAB_APP_SECRET")
+    token_path = os.environ.get("SCHWAB_TOKEN_PATH", "token.json")
+
+    if not api_key or not app_secret:
         raise AuthError(
-            "Missing credentials. Copy .env.example to .env and fill it in."
+            "Missing credentials. Add your Schwab App Key and Secret from the "
+            "dashboard Settings page (or fill in credentials.env)."
         )
-    if not os.path.exists(_TOKEN_PATH):
+    if not os.path.exists(token_path):
         raise AuthError(
-            f"No token at '{_TOKEN_PATH}'. Run: python auth_setup.py"
+            f"No token at '{token_path}'. Reconnect Schwab from the dashboard "
+            "Settings page."
         )
     try:
-        return auth.client_from_token_file(_TOKEN_PATH, _API_KEY, _APP_SECRET)
+        return auth.client_from_token_file(token_path, api_key, app_secret)
     except Exception as exc:  # schwab-py raises on a dead refresh token
         raise AuthError(
             "Could not load or refresh the token (it may have expired). "
-            "Re-authenticate with: python auth_setup.py"
+            "Reconnect Schwab from the dashboard Settings page."
         ) from exc
 
 

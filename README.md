@@ -38,11 +38,18 @@ cp .env.example .env
 ```
 
 Then edit `.env`:
-- Paste your Schwab **App Key** and **Secret**.
 - Set **`APP_DATA_DIR`** to the absolute path of your dashboard app's `data/`
   folder (this is where the JSON snapshots are written).
 
+Your Schwab **App Key** and **Secret** do *not* go in `.env`. Either set them
+once from the dashboard (see [Connect from the dashboard](#connect-from-the-dashboard)
+below — recommended), or copy `credentials.env.example` → `credentials.env` and
+paste them there.
+
 ### 4. Authenticate
+
+The easiest way is from the dashboard (see below — it also works headless and
+from your phone). To do it from the CLI instead:
 
 ```bash
 python auth_setup.py
@@ -63,24 +70,49 @@ This runs the push loop that feeds the dashboard's `data/` folder. To run it
 (`systemd`, `pm2`, etc.) pointed at `.venv/bin/python auto_push.py` with this
 folder as the working directory.
 
+## Connect from the dashboard
+
+The dashboard app can handle both first-run setup and the weekly re-login for
+you — no CLI, and it works headless / from your phone. The app is **write-only**
+toward this bridge: it *deposits* your App Key/Secret and the pasted login URL
+into this folder and never reads the bridge's secrets back.
+
+Open the app's **Settings → Schwab connection** and:
+
+1. **First run:** paste your **App Key** and **App Secret**. The app writes them
+   to `credentials.env` (chmod 600) and asks the bridge for a login link.
+2. Click **Log in to Schwab**, approve access, then copy the whole address you
+   land on (`https://127.0.0.1:8182/?code=…` — the page won't load; that's
+   expected).
+3. Paste that URL back and **Finish**. The bridge exchanges it, writes
+   `token.json`, and live data resumes within a cycle.
+
+Under the hood, `reauth.py` (driven by the `auto_push` loop) watches
+`reauth_inbox/`, generates the login URL with `get_auth_context`, and completes
+the exchange with `client_from_received_url` — the OAuth `state` is generated
+and validated on the bridge, end to end. Progress is reported back one-way
+through a sanitized `schwab-auth.json` in the app's `data/` folder (no secrets).
+
 ## When it stops working after ~7 days
 
 Schwab refuses to refresh the token after about seven days. `auto_push.py` will
-log `invalid_grant` errors. Fix it by re-authenticating and restarting:
+log `invalid_grant` errors. The easiest fix is **Settings → Schwab connection →
+Reconnect** in the dashboard (above). From the CLI instead:
 
 ```bash
 python auth_setup.py          # re-run the browser login, rewrites token.json
 ```
 
-(If running headless, authenticate on a machine with a browser and copy the
-fresh `token.json` over, then restart the service.)
+(If running headless without the dashboard, authenticate on a machine with a
+browser and copy the fresh `token.json` over, then restart the service.)
 
 ## Files
 
 | File                    | Role                                                     |
 |-------------------------|----------------------------------------------------------|
-| `auth_setup.py`         | Interactive Schwab login; writes `token.json`            |
-| `auto_push.py`          | Main loop — pushes data to the dashboard                 |
+| `auth_setup.py`         | Interactive CLI Schwab login; writes `token.json`        |
+| `reauth.py`             | App-driven login/exchange (dashboard Settings → Connect) |
+| `auto_push.py`          | Main loop — pushes data + services the re-auth inbox     |
 | `schwab_client.py`      | Read-only Schwab data layer (balances, positions, orders)|
 | `export_to_app.py`      | Writes the dashboard JSON snapshot                       |
 | `sync_trade_history.py` | Builds trade / transaction history                       |
@@ -88,9 +120,13 @@ fresh `token.json` over, then restart the service.)
 
 ## Security notes
 
-- **Never commit** `token.json` or `.env` — they hold live API credentials.
-  They're already in `.gitignore`; keep them there.
-- Copy `.env.example` → `.env` and fill in your own values. `.env.example` is a
-  placeholder and safe to commit.
+- **Never commit** `token.json`, `.env`, or `credentials.env` — they hold live
+  API credentials. They're already in `.gitignore`; keep them there.
+- Your App Key/Secret live in `credentials.env` (written by the dashboard, or by
+  hand from `credentials.env.example`). The dashboard is **write-only** toward
+  this folder — it deposits credentials and the pasted login URL and never reads
+  them back; `.env` holds only non-secret config and refresh intervals.
+- Copy `.env.example` → `.env` for that config. The `.example` files are
+  placeholders and safe to commit.
 - Trade execution is intentionally **not** in this codebase. If you add it
   later, keep it in a separate module so this read-only surface stays small.
