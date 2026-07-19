@@ -406,6 +406,16 @@ def _combine_spreads(s_trips: list[dict[str, Any]], l_trips: list[dict[str, Any]
 _EQUITY_ASSET_TYPES = {"EQUITY", "COLLECTIVE_INVESTMENT"}
 
 
+def _is_assignment(txn: dict[str, Any]) -> bool:
+    """A RECEIVE_AND_DELIVER removes an option either by ASSIGNMENT (shares move
+    at the strike) or by EXPIRATION (the option simply drops off — no shares
+    move). Schwab distinguishes them only in the free-text description:
+    'Removed due to Assignment ...' vs 'Removed due to Expiration ...'. Treating
+    an expiration as an assignment invents a phantom stock disposal, so gate on
+    this."""
+    return "assignment" in (txn.get("description") or "").lower()
+
+
 def _equity_events_from_txns(records: list[dict[str, Any]], prem_per_share: dict[tuple[str, float], float] | None = None) -> dict[str, list[dict[str, Any]]]:
     """Per-symbol chronological equity events from the TRANSACTIONS feed.
 
@@ -443,6 +453,8 @@ def _equity_events_from_txns(records: list[dict[str, Any]], prem_per_share: dict
                 )
 
             elif ttype == "RECEIVE_AND_DELIVER" and atype == "OPTION":
+                if not _is_assignment(t):
+                    continue   # expiration removal — the option is gone but no shares moved
                 pc = (instr.get("putCall") or "").upper()
                 strike = instr.get("strikePrice")
                 underlying = instr.get("underlyingSymbol")
@@ -618,6 +630,8 @@ def _put_assignment_contracts(records: list[dict[str, Any]]) -> dict[tuple[str, 
     for t in records:
         if (t.get("type") or "").upper() != "RECEIVE_AND_DELIVER":
             continue
+        if not _is_assignment(t):
+            continue   # expired put, not assigned — no shares, no premium to fold
         for ti in t.get("transferItems", []) or []:
             instr = ti.get("instrument") or {}
             if (instr.get("assetType") or "").upper() != "OPTION":
