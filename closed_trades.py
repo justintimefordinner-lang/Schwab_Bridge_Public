@@ -185,7 +185,7 @@ def _round(n: float, d: int = 2) -> float:
     return round(n, d)
 
 
-def _build_csp(t: dict[str, Any], fpc: Callable[[Any], float] = _no_fee) -> dict[str, Any] | None:
+def _build_csp(t: dict[str, Any], fpc: Callable[[Any], float] = _no_fee, assigned: bool = False) -> dict[str, Any] | None:
     credit = t["open_price"]
     close_px = t["close_price"]
     strike = t["strike"]
@@ -199,7 +199,15 @@ def _build_csp(t: dict[str, Any], fpc: Callable[[Any], float] = _no_fee) -> dict
     collateral = strike * 100 * qty
     days = _days_held(t["open_time"], t["close_time"])
     roc = realized / collateral if collateral else 0.0
-    outcome = "expired" if t["expired"] else ("closed_profit" if realized >= 0 else "closed_loss")
+    if assigned:
+        # Assigned into shares: the net premium is folded into the assigned shares'
+        # cost basis (see build_from_history), so it is NOT also booked as a realized
+        # option gain here — otherwise it double-counts against the reduced stock avg.
+        outcome = "assigned"
+        realized = 0.0
+        roc = 0.0
+    else:
+        outcome = "expired" if t["expired"] else ("closed_profit" if realized >= 0 else "closed_loss")
     return {
         "id": f"{t['ticker']}-{strike}P-{t['expiration']}-{t['open_time'][:10]}",
         "symbol": t["ticker"], "name": t["ticker"],
@@ -209,7 +217,7 @@ def _build_csp(t: dict[str, Any], fpc: Callable[[Any], float] = _no_fee) -> dict
         "creditPerShare": _round(credit), "creditReceived": _round(credit_received),
         "costToClose": _round(cost_to_close), "fees": _round(fees), "realizedPnl": _round(realized),
         "outcome": outcome, "daysHeld": days, "collateral": _round(collateral),
-        "returnOnCollateral": _round(roc, 4), "annualized": _round(roc * 365 / days, 4),
+        "returnOnCollateral": _round(roc, 4), "annualized": _round(roc * 365 / days, 4) if days else 0.0,
     }
 
 
@@ -364,7 +372,7 @@ def _combine_spreads(s_trips: list[dict[str, Any]], l_trips: list[dict[str, Any]
 _EQUITY_ASSET_TYPES = {"EQUITY", "COLLECTIVE_INVESTMENT"}
 
 
-def _equity_events_from_txns(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+def _equity_events_from_txns(records: list[dict[str, Any]], prem_per_share: dict[tuple[str, float], float] | None = None) -> dict[str, list[dict[str, Any]]]:
     """Per-symbol chronological equity events from the TRANSACTIONS feed.
 
     Two sources, so assignment cost basis is captured (orders miss it):
@@ -411,9 +419,16 @@ def _equity_events_from_txns(records: list[dict[str, Any]]) -> dict[str, list[di
                 if not underlying or strike is None or shares <= 0 or pc not in ("PUT", "CALL"):
                     continue
                 # PUT assigned → buy shares at strike; CALL assigned → sell at strike.
+                # Option A: for puts, net the collected premium off the cost basis so
+                # the wheel's premium lives in the shares rather than being double-
+                # counted as a realized CSP gain. prem_per_share carries the matched
+                # put premium per share (0.0 when not linked to an assigned put).
                 instruction = "BUY" if pc == "PUT" else "SELL"
+                price = strike
+                if pc == "PUT" and prem_per_share:
+                    price = strike - prem_per_share.get((underlying, round(float(strike), 2)), 0.0)
                 by_sym.setdefault(underlying, []).append(
-                    {"time": when, "instruction": instruction, "qty": shares, "price": strike}
+                    {"time": when, "instruction": instruction, "qty": shares, "price": price}
                 )
     return by_sym
 
@@ -518,6 +533,30 @@ def _fee_index_by_order(txns_store: dict[str, list[dict[str, Any]]] | None) -> d
     return idx
 
 
+def _put_assignment_contracts(records: list[dict[str, Any]]) -> dict[tuple[str, float], float]:
+    """From one account's TRANSACTIONS feed: total PUT-assignment contracts per
+    (underlying, strike). Lets us tell which expired short puts were actually
+    assigned (vs expired worthless), so their premium can be folded into the
+    shares instead of double-counted as a realized CSP gain (Option A)."""
+    out: dict[tuple[str, float], float] = {}
+    for t in records:
+        if (t.get("type") or "").upper() != "RECEIVE_AND_DELIVER":
+            continue
+        for ti in t.get("transferItems", []) or []:
+            instr = ti.get("instrument") or {}
+            if (instr.get("assetType") or "").upper() != "OPTION":
+                continue
+            if (instr.get("putCall") or "").upper() != "PUT":
+                continue
+            strike = instr.get("strikePrice")
+            underlying = instr.get("underlyingSymbol")
+            contracts = abs(ti.get("amount") or 0)
+            if underlying and strike is not None and contracts > 0:
+                key = (underlying, round(float(strike), 2))
+                out[key] = out.get(key, 0.0) + contracts
+    return out
+
+
 def build_from_history(
     store: dict[str, list[dict[str, Any]]],
     txns_store: dict[str, list[dict[str, Any]]] | None = None,
@@ -542,10 +581,24 @@ def build_from_history(
             return 0.0
         return slot["fee"] / slot["contracts"]
 
-    # Options come from the ORDERS feed.
-    for records in store.values():
-        spread_occs, pairs = _spread_partners(records)
-        trips_by_occ = {occ: _fifo_round_trips(evs, today) for occ, evs in _events_for_contract(records).items()}
+    txns_store = txns_store or {}
+    # Process each account with BOTH feeds together, so an assigned put (orders
+    # feed) can hand its premium to its shares (transactions feed) within the
+    # same account.
+    for aid in set(store) | set(txns_store):
+        orders = store.get(aid, [])
+        txns = txns_store.get(aid, [])
+
+        # PUT contracts assigned per (underlying, strike); we draw from this budget
+        # to decide which expired short puts were assigned.
+        assign_budget = _put_assignment_contracts(txns)
+        # Net premium of the puts we mark assigned, to fold into those shares' cost
+        # basis: {(underlying, strike): [net_premium_dollars, shares]}.
+        assign_premium: dict[tuple[str, float], list[float]] = {}
+
+        # ---- Options: from the ORDERS feed ----
+        spread_occs, pairs = _spread_partners(orders)
+        trips_by_occ = {occ: _fifo_round_trips(evs, today) for occ, evs in _events_for_contract(orders).items()}
 
         # Spreads: combine each detected short/long pair into one round-trip.
         for short_occ, long_occ in pairs:
@@ -558,9 +611,21 @@ def build_from_history(
             for t in trips:
                 is_put = t["putCall"] in ("PUT", "P")
                 if t["short"] and is_put:
-                    rec = _build_csp(t, fpc)             # naked short put = CSP
-                    if rec:
-                        csp_closed.append(rec)
+                    # A short put that passed expiration with no closing order is
+                    # either expired-worthless OR assigned. If the transactions feed
+                    # shows an assignment at this (underlying, strike), treat it as
+                    # assigned and hand its premium to the shares (Option A).
+                    key = (t["ticker"], round(float(t["strike"]), 2)) if t["strike"] is not None else None
+                    assigned = bool(t["expired"] and key and assign_budget.get(key, 0.0) >= t["qty"])
+                    rec = _build_csp(t, fpc, assigned=assigned)
+                    if not rec:
+                        continue
+                    csp_closed.append(rec)
+                    if assigned and key:
+                        assign_budget[key] -= t["qty"]
+                        slot = assign_premium.setdefault(key, [0.0, 0.0])
+                        slot[0] += rec["creditReceived"] - rec["fees"]  # net premium $
+                        slot[1] += t["qty"] * 100                       # shares assigned
                 elif t["short"] and not is_put:
                     rec = _build_covered_call(t, fpc)    # short call = covered call
                     if rec:
@@ -570,9 +635,10 @@ def build_from_history(
                     if rec:
                         leap_closed.append(rec)
 
-    # Stocks come from the TRANSACTIONS feed (captures assignment cost basis).
-    for records in (txns_store or {}).values():
-        for sym, evs in _equity_events_from_txns(records).items():
+        # ---- Stocks: from the TRANSACTIONS feed, with assigned-put premium netted
+        #      off the shares' cost basis (contracts-weighted per strike). ----
+        prem_per_share = {k: (v[0] / v[1] if v[1] else 0.0) for k, v in assign_premium.items()}
+        for sym, evs in _equity_events_from_txns(txns, prem_per_share).items():
             for i, t in enumerate(_equity_round_trips(evs)):
                 rec = _build_stock(t, sym, i)
                 if rec:
