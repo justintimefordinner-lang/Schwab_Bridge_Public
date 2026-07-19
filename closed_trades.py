@@ -635,11 +635,11 @@ def _put_assignment_contracts(records: list[dict[str, Any]]) -> dict[tuple[str, 
 
 def _orphan_id(symbol: str, orph: dict[str, Any]) -> str:
     """Stable id for an unmatched stock sale, so a user-entered basis sticks
-    across rebuilds. Includes the orderId when present so two same-day sales at
-    the same price can't share an id."""
-    oid = orph.get("order_id")
-    tail = f"|{oid}" if oid is not None else ""
-    return f"{symbol}|{(orph.get('close_time') or '')[:10]}|{orph['qty']:g}|{orph.get('close_price')}{tail}"
+    across rebuilds. Two same-day sales at the same price (e.g. a market sell and
+    a covered-call assignment) are disambiguated by the '#N' counter in
+    build_from_history rather than the orderId, so ids stay stable even for
+    assignment legs that carry no orderId."""
+    return f"{symbol}|{(orph.get('close_time') or '')[:10]}|{orph['qty']:g}|{orph.get('close_price')}"
 
 
 def build_from_history(
