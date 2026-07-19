@@ -37,6 +37,8 @@ SPREADS_FILE = "spreads-closed.json"
 COVERED_FILE = "covered-closed.json"
 STOCKS_FILE = "stocks-closed.json"
 TXNS_FILE = "transactions.json"
+UNRESOLVED_FILE = "stocks-unresolved.json"     # bridge writes: stock sales needing a manual cost basis
+MANUAL_BASIS_FILE = "manual_cost_basis.json"   # app writes: {orphanId: {"costPerShare": x}}
 SOURCE_LABEL = "schwab-bridge"
 
 OPEN_INSTRUCTIONS = {"SELL_TO_OPEN", "BUY_TO_OPEN"}
@@ -465,13 +467,16 @@ def _equity_events_from_txns(records: list[dict[str, Any]], prem_per_share: dict
     return by_sym
 
 
-def _equity_round_trips(evs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _equity_round_trips(evs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """FIFO-match equity opens to closes. Longs: BUY opens, SELL closes. Shorts:
-    SELL_SHORT opens, BUY_TO_COVER closes. Long and short lots queue separately."""
+    SELL_SHORT opens, BUY_TO_COVER closes. Long and short lots queue separately.
+    Returns (round_trips, orphans): orphans are closes with no matching open lot
+    (the purchase predates our transaction history) — they need a manual cost basis."""
     evs = sorted(evs, key=lambda e: e["time"])
     long_lots: deque[dict[str, Any]] = deque()
     short_lots: deque[dict[str, Any]] = deque()
     trips: list[dict[str, Any]] = []
+    orphans: list[dict[str, Any]] = []
 
     def close_against(lots: deque[dict[str, Any]], ev: dict[str, Any], side: str) -> None:
         remaining = ev["qty"]
@@ -487,6 +492,11 @@ def _equity_round_trips(evs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             remaining -= matched
             if lot["qty"] == 0:
                 lots.popleft()
+        if remaining > 0:
+            # Sold more than we have an opening record for — the purchase is older
+            # than the transaction feed. Surface it so the user can supply a basis.
+            orphans.append({"side": side, "qty": remaining,
+                            "close_time": ev["time"], "close_price": ev["price"]})
 
     for ev in evs:
         instr = ev["instruction"]
@@ -498,7 +508,7 @@ def _equity_round_trips(evs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             close_against(long_lots, ev, "long")
         elif instr == "BUY_TO_COVER":
             close_against(short_lots, ev, "short")
-    return trips
+    return trips, orphans
 
 
 def _build_stock(t: dict[str, Any], symbol: str, idx: int) -> dict[str, Any] | None:
@@ -520,7 +530,7 @@ def _build_stock(t: dict[str, Any], symbol: str, idx: int) -> dict[str, Any] | N
         "costBasis": _round(cost_basis), "proceeds": _round(proceeds),
         "realizedPnl": _round(realized), "outcome": outcome,
         "openedAt": t["open_time"][:10], "closedAt": (t["close_time"] or "")[:10],
-        "daysHeld": days, "returnPct": _round(ret, 4), "annualized": _round(ret * 365 / days, 4),
+        "daysHeld": days, "returnPct": _round(ret, 4), "annualized": _round(ret * 365 / days, 4) if days else 0.0,
     }
 
 
@@ -589,9 +599,16 @@ def _put_assignment_contracts(records: list[dict[str, Any]]) -> dict[tuple[str, 
     return out
 
 
+def _orphan_id(symbol: str, orph: dict[str, Any]) -> str:
+    """Stable id for an unmatched stock sale, so a user-entered basis sticks
+    across rebuilds."""
+    return f"{symbol}|{(orph.get('close_time') or '')[:10]}|{orph['qty']:g}|{orph.get('close_price')}"
+
+
 def build_from_history(
     store: dict[str, list[dict[str, Any]]],
     txns_store: dict[str, list[dict[str, Any]]] | None = None,
+    manual_basis: dict[str, float] | None = None,
 ) -> dict[str, list]:
     today = datetime.now(timezone.utc).date()
     csp_closed: list[dict[str, Any]] = []
@@ -599,6 +616,8 @@ def build_from_history(
     spread_closed: list[dict[str, Any]] = []
     covered_closed: list[dict[str, Any]] = []
     stock_closed: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []   # stock sales whose purchase predates our data
+    manual_basis = manual_basis or {}
 
     # Per-contract option fees, joined to round-trips by orderId, so realized P&L
     # comes out net of commissions/regulatory fees (matching Schwab).
@@ -673,17 +692,39 @@ def build_from_history(
                     leap_closed.append(rec)
 
         # ---- Stocks: from the TRANSACTIONS feed, with assigned-put premium netted
-        #      off the shares' cost basis (contracts-weighted per strike). ----
+        #      off the shares' cost basis (contracts-weighted per strike). Sales whose
+        #      purchase predates the feed get a user-entered basis if one is on file,
+        #      otherwise they're surfaced as "unresolved" for the app to prompt. ----
         prem_per_share = {k: (v[0] / v[1] if v[1] else 0.0) for k, v in assign_premium.items()}
         for sym, evs in _equity_events_from_txns(txns, prem_per_share).items():
-            for i, t in enumerate(_equity_round_trips(evs)):
+            rts, orphans = _equity_round_trips(evs)
+            for i, t in enumerate(rts):
                 rec = _build_stock(t, sym, i)
                 if rec:
                     stock_closed.append(rec)
+            for orph in orphans:
+                oid = _orphan_id(sym, orph)
+                basis = manual_basis.get(oid)
+                if basis is not None:
+                    t = {"side": orph["side"], "qty": orph["qty"],
+                         "open_price": float(basis), "close_price": orph["close_price"],
+                         "open_time": "", "close_time": orph["close_time"]}
+                    rec = _build_stock(t, sym, oid)
+                    if rec:
+                        rec["manualBasis"] = True
+                        stock_closed.append(rec)
+                else:
+                    unresolved.append({
+                        "id": oid, "symbol": sym, "side": orph["side"],
+                        "shares": _round(orph["qty"], 4),
+                        "soldAt": _round(orph.get("close_price") or 0.0, 4),
+                        "closeDate": (orph.get("close_time") or "")[:10],
+                    })
 
     for lst in (csp_closed, leap_closed, spread_closed, covered_closed, stock_closed):
         lst.sort(key=lambda r: r["closedAt"], reverse=True)
-    return {"csp": csp_closed, "leap": leap_closed, "spread": spread_closed, "covered": covered_closed, "stock": stock_closed}
+    return {"csp": csp_closed, "leap": leap_closed, "spread": spread_closed, "covered": covered_closed,
+            "stock": stock_closed, "_unresolved": unresolved}
 
 
 def _load_txns(data_dir: str) -> dict[str, list[dict[str, Any]]]:
@@ -696,22 +737,43 @@ def _load_txns(data_dir: str) -> dict[str, list[dict[str, Any]]]:
         return {}
 
 
+def _load_manual_basis(data_dir: str) -> dict[str, float]:
+    """User-entered cost bases for stock sales whose purchase predates the feed,
+    keyed by orphan id. Written by the app to manual_cost_basis.json in the data
+    folder; accepts either {id: costPerShare} or {id: {"costPerShare": x}}."""
+    out: dict[str, float] = {}
+    try:
+        with open(os.path.join(data_dir, MANUAL_BASIS_FILE), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return out
+    if not isinstance(data, dict):
+        return out
+    for k, v in data.items():
+        cps = v.get("costPerShare") if isinstance(v, dict) else v
+        if isinstance(cps, (int, float)):
+            out[k] = float(cps)
+    return out
+
+
 def write_closed(data_dir: str, store: dict[str, list[dict[str, Any]]]) -> dict[str, int]:
     txns_store = _load_txns(data_dir)
-    closed = build_from_history(store, txns_store)
+    manual_basis = _load_manual_basis(data_dir)
+    closed = build_from_history(store, txns_store, manual_basis)
     now = datetime.now(timezone.utc).isoformat()
     note = "Options reconstructed from order history (FIFO); stocks from the transactions feed incl. assignment cost basis. Spreads are same-underlying/type/expiration verticals."
 
-    def dump(filename: str, items: list) -> None:
+    def dump(filename: str, key: str, wrapper: str = "closed") -> None:
         with open(os.path.join(data_dir, filename), "w", encoding="utf-8") as f:
-            json.dump({"meta": {"generatedAt": now, "source": SOURCE_LABEL, "note": note}, "closed": items}, f, indent=2)
+            json.dump({"meta": {"generatedAt": now, "source": SOURCE_LABEL, "note": note}, wrapper: closed[key]}, f, indent=2)
 
-    dump(CSP_FILE, closed["csp"])
-    dump(LEAPS_FILE, closed["leap"])
-    dump(SPREADS_FILE, closed["spread"])
-    dump(COVERED_FILE, closed["covered"])
-    dump(STOCKS_FILE, closed["stock"])
-    return {k: len(v) for k, v in closed.items()}
+    dump(CSP_FILE, "csp")
+    dump(LEAPS_FILE, "leap")
+    dump(SPREADS_FILE, "spread")
+    dump(COVERED_FILE, "covered")
+    dump(STOCKS_FILE, "stock")
+    dump(UNRESOLVED_FILE, "_unresolved", wrapper="unresolved")
+    return {k: len(v) for k, v in closed.items() if not k.startswith("_")}
 
 
 def main() -> None:
