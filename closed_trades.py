@@ -420,6 +420,7 @@ def _equity_events_from_txns(records: list[dict[str, Any]], prem_per_share: dict
     for t in records:
         ttype = (t.get("type") or "").upper()
         when = t.get("tradeDate") or t.get("time") or ""
+        oid = t.get("orderId")
         for ti in t.get("transferItems", []) or []:
             instr = ti.get("instrument") or {}
             atype = (instr.get("assetType") or "").upper()
@@ -438,7 +439,7 @@ def _equity_events_from_txns(records: list[dict[str, Any]], prem_per_share: dict
                 else:  # fall back to sign
                     instruction = "BUY" if amount > 0 else "SELL"
                 by_sym.setdefault(sym, []).append(
-                    {"time": when, "instruction": instruction, "qty": abs(amount), "price": price}
+                    {"time": when, "instruction": instruction, "qty": abs(amount), "price": price, "order_id": oid}
                 )
 
             elif ttype == "RECEIVE_AND_DELIVER" and atype == "OPTION":
@@ -462,9 +463,41 @@ def _equity_events_from_txns(records: list[dict[str, Any]], prem_per_share: dict
                 if pc == "PUT" and prem_per_share:
                     price = strike - prem_per_share.get((underlying, round(float(strike), 2)), 0.0)
                 by_sym.setdefault(underlying, []).append(
-                    {"time": when, "instruction": instruction, "qty": shares, "price": price}
+                    {"time": when, "instruction": instruction, "qty": shares, "price": price, "order_id": oid}
                 )
-    return by_sym
+    # Collapse multi-fill orders: one sell/buy order can fill in several lots, each
+    # arriving as its own transaction under a shared orderId. Merge them so a
+    # 1,000-share order that filled 934 + 66 is one 1,000-share event, not two.
+    return {sym: _coalesce_orders(evs) for sym, evs in by_sym.items()}
+
+
+def _coalesce_orders(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge executions that share an orderId + instruction into a single event:
+    quantities summed, price share-weighted, earliest fill time kept. Events with
+    no orderId (e.g. assignments) pass through untouched, so distinct dispositions
+    stay separate."""
+    merged: dict[tuple[Any, str], dict[str, Any]] = {}
+    out: list[dict[str, Any]] = []
+    for ev in events:
+        oid = ev.get("order_id")
+        if oid is None:
+            out.append(ev)
+            continue
+        key = (oid, ev["instruction"])
+        slot = merged.get(key)
+        if slot is None:
+            slot = {"time": ev["time"], "instruction": ev["instruction"],
+                    "qty": 0.0, "_notional": 0.0, "order_id": oid}
+            merged[key] = slot
+            out.append(slot)
+        slot["qty"] += ev["qty"]
+        slot["_notional"] += ev["qty"] * ev["price"]
+        if ev["time"] < slot["time"]:
+            slot["time"] = ev["time"]
+    for slot in merged.values():
+        slot["price"] = slot["_notional"] / slot["qty"] if slot["qty"] else 0.0
+        del slot["_notional"]
+    return out
 
 
 def _equity_round_trips(evs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -496,7 +529,8 @@ def _equity_round_trips(evs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
             # Sold more than we have an opening record for — the purchase is older
             # than the transaction feed. Surface it so the user can supply a basis.
             orphans.append({"side": side, "qty": remaining,
-                            "close_time": ev["time"], "close_price": ev["price"]})
+                            "close_time": ev["time"], "close_price": ev["price"],
+                            "order_id": ev.get("order_id")})
 
     for ev in evs:
         instr = ev["instruction"]
@@ -601,8 +635,11 @@ def _put_assignment_contracts(records: list[dict[str, Any]]) -> dict[tuple[str, 
 
 def _orphan_id(symbol: str, orph: dict[str, Any]) -> str:
     """Stable id for an unmatched stock sale, so a user-entered basis sticks
-    across rebuilds."""
-    return f"{symbol}|{(orph.get('close_time') or '')[:10]}|{orph['qty']:g}|{orph.get('close_price')}"
+    across rebuilds. Includes the orderId when present so two same-day sales at
+    the same price can't share an id."""
+    oid = orph.get("order_id")
+    tail = f"|{oid}" if oid is not None else ""
+    return f"{symbol}|{(orph.get('close_time') or '')[:10]}|{orph['qty']:g}|{orph.get('close_price')}{tail}"
 
 
 def build_from_history(
@@ -617,6 +654,7 @@ def build_from_history(
     covered_closed: list[dict[str, Any]] = []
     stock_closed: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []   # stock sales whose purchase predates our data
+    seen_orphan_ids: dict[str, int] = {}    # guarantees each surfaced sale has a unique id
     manual_basis = manual_basis or {}
 
     # Per-contract option fees, joined to round-trips by orderId, so realized P&L
@@ -704,6 +742,10 @@ def build_from_history(
                     stock_closed.append(rec)
             for orph in orphans:
                 oid = _orphan_id(sym, orph)
+                n = seen_orphan_ids.get(oid, 0)
+                seen_orphan_ids[oid] = n + 1
+                if n:
+                    oid = f"{oid}#{n}"   # identical unmatched sale — keep ids distinct
                 basis = manual_basis.get(oid)
                 if basis is not None:
                     t = {"side": orph["side"], "qty": orph["qty"],
