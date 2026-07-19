@@ -83,7 +83,11 @@ def _events_for_contract(records: list[dict[str, Any]]) -> dict[str, list[dict[s
             if price is None and len(opt_legs) == 1:
                 price = order_fill  # single-leg order: leg price == order fill
             events.setdefault(occ, []).append({
-                "time": o.get("enteredTime", "") or "",
+                # Fill/terminal time (closeTime), NOT placement time (enteredTime):
+                # a GTC limit placed weeks before it fills must be dated — and
+                # FIFO-ordered — by when it actually executed, or the round-trip
+                # lands on the submit date and shows the wrong close date / days-held.
+                "time": o.get("closeTime") or o.get("enteredTime", "") or "",
                 "instruction": (leg.get("instruction") or "").upper(),
                 "positionEffect": (leg.get("positionEffect") or "").upper(),
                 "qty": abs(leg.get("quantity") or 0),
