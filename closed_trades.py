@@ -275,6 +275,12 @@ def _spread_partners(records: list[dict[str, Any]]) -> tuple[set[str], set[tuple
                     and a.get("expiration") == b.get("expiration")
                     and a.get("strike") != b.get("strike")
                     and a.get("symbol") and b.get("symbol")
+                    # Both legs must open together (OPENING) or close together (CLOSING)
+                    # to be a vertical. A roll or diagonal — one leg CLOSING and one
+                    # OPENING in the same order — is NOT a spread, even though it also
+                    # has one short-side and one long-side leg.
+                    and (a.get("positionEffect") or "").upper() == (b.get("positionEffect") or "").upper()
+                    and (a.get("positionEffect") or "").upper() in ("OPENING", "CLOSING")
                 ):
                     short_occ = long_occ = None
                     for leg in (a, b):

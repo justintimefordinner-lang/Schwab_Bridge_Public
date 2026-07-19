@@ -69,8 +69,11 @@ TXN_LOOKBACK_DAYS = 58        # transactions API only allows ~60 days back per r
 BACKFILL_WINDOW_DAYS = 20     # smaller windows = smaller, faster responses
 BACKFILL_MAX_WINDOWS = 40     # safety cap (~2 years)
 STOP_AFTER_EMPTY = 3          # stop backfill after this many empty windows
-ROLLING_DAYS = 2              # rolling order-refresh window (runs frequently, so 2d is plenty)
-TXN_ROLLING_DAYS = 3          # rolling transaction window for frequent (non-deep) runs
+ROLLING_DAYS = 10             # rolling order-refresh window — wide enough to survive a
+                             # multi-day sync gap (e.g. the weekly token expiry) without
+                             # permanently dropping orders. Upsert-by-orderId dedupes, so a
+                             # wider window just re-confirms recent orders cheaply.
+TXN_ROLLING_DAYS = 10         # rolling transaction window for frequent (non-deep) runs
 REQUEST_TIMEOUT = 60          # seconds; default 30 was too short for busy windows
 WINDOW_RETRIES = 2            # retry a window this many times on timeout
 
