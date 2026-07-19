@@ -367,16 +367,38 @@ def _build_spread(s: dict[str, Any], l: dict[str, Any], fpc: Callable[[Any], flo
     }
 
 
-def _combine_spreads(s_trips: list[dict[str, Any]], l_trips: list[dict[str, Any]], fpc: Callable[[Any], float] = _no_fee) -> list[dict[str, Any]]:
-    """Pair a spread's short-leg and long-leg round-trips (they open/close
-    together) by chronological order, and value each as one spread."""
-    out = []
-    for s, l in zip(sorted(s_trips, key=lambda t: t["open_time"]),
-                    sorted(l_trips, key=lambda t: t["open_time"])):
-        rec = _build_spread(s, l, fpc)
-        if rec:
+def _closed_together(s: dict[str, Any], l: dict[str, Any]) -> bool:
+    """Two legs form one spread only if they were closed as a unit — in the same
+    closing order, or both expired. Legs closed on different dates ('legged out')
+    are reported individually on their own close dates, matching how Schwab books
+    each lot separately."""
+    so, lo = s.get("close_order"), l.get("close_order")
+    if so is not None and lo is not None:
+        return so == lo
+    if so is None and lo is None:
+        return bool(s.get("expired") and l.get("expired"))
+    return False
+
+
+def _combine_spreads(s_trips: list[dict[str, Any]], l_trips: list[dict[str, Any]], fpc: Callable[[Any], float] = _no_fee) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Pair each short-leg round-trip with the long-leg round-trip it was CLOSED
+    WITH, and value the pair as one spread. Returns (spread_records, leftovers):
+    legs that were legged out (closed at different times) come back as leftovers
+    so the caller reports them as individual single-leg trades on their own dates."""
+    out: list[dict[str, Any]] = []
+    longs = sorted(l_trips, key=lambda t: t["open_time"])
+    used = [False] * len(longs)
+    leftovers: list[dict[str, Any]] = []
+    for s in sorted(s_trips, key=lambda t: t["open_time"]):
+        mi = next((i for i, l in enumerate(longs) if not used[i] and _closed_together(s, l)), None)
+        rec = _build_spread(s, longs[mi], fpc) if mi is not None else None
+        if rec is not None:
+            used[mi] = True
             out.append(rec)
-    return out
+        else:
+            leftovers.append(s)  # no closed-together partner (or unvaluable) → individual
+    leftovers.extend(l for i, l in enumerate(longs) if not used[i])
+    return out, leftovers
 
 
 _EQUITY_ASSET_TYPES = {"EQUITY", "COLLECTIVE_INVESTMENT"}
@@ -610,40 +632,45 @@ def build_from_history(
         spread_occs, pairs = _spread_partners(orders)
         trips_by_occ = {occ: _fifo_round_trips(evs, today) for occ, evs in _events_for_contract(orders).items()}
 
-        # Spreads: combine each detected short/long pair into one round-trip.
+        # Spreads: merge only legs CLOSED TOGETHER; legged-out legs come back as
+        # leftovers to be reported individually on their own close dates.
+        spread_leftovers: list[dict[str, Any]] = []
         for short_occ, long_occ in pairs:
-            spread_closed.extend(_combine_spreads(trips_by_occ.get(short_occ, []), trips_by_occ.get(long_occ, []), fpc))
+            recs, leftover = _combine_spreads(trips_by_occ.get(short_occ, []), trips_by_occ.get(long_occ, []), fpc)
+            spread_closed.extend(recs)
+            spread_leftovers.extend(leftover)
 
-        # Everything that ISN'T a spread leg classifies on its own.
-        for occ, trips in trips_by_occ.items():
-            if occ in spread_occs:
-                continue
-            for t in trips:
-                is_put = t["putCall"] in ("PUT", "P")
-                if t["short"] and is_put:
-                    # A short put that passed expiration with no closing order is
-                    # either expired-worthless OR assigned. If the transactions feed
-                    # shows an assignment at this (underlying, strike), treat it as
-                    # assigned and hand its premium to the shares (Option A).
-                    key = (t["ticker"], round(float(t["strike"]), 2)) if t["strike"] is not None else None
-                    assigned = bool(t["expired"] and key and assign_budget.get(key, 0.0) >= t["qty"])
-                    rec = _build_csp(t, fpc, assigned=assigned)
-                    if not rec:
-                        continue
-                    csp_closed.append(rec)
-                    if assigned and key:
-                        assign_budget[key] -= t["qty"]
-                        slot = assign_premium.setdefault(key, [0.0, 0.0])
-                        slot[0] += rec["creditReceived"] - rec["fees"]  # net premium $
-                        slot[1] += t["qty"] * 100                       # shares assigned
-                elif t["short"] and not is_put:
-                    rec = _build_covered_call(t, fpc)    # short call = covered call
-                    if rec:
-                        covered_closed.append(rec)
-                elif not t["short"]:
-                    rec = _build_leap(t, fpc)            # long call/put = LEAP
-                    if rec:
-                        leap_closed.append(rec)
+        # Individual single-leg trades: every non-spread contract's round-trips,
+        # plus any legged-out spread legs.
+        individual = [t for occ, trips in trips_by_occ.items() if occ not in spread_occs for t in trips]
+        individual.extend(spread_leftovers)
+
+        for t in individual:
+            is_put = t["putCall"] in ("PUT", "P")
+            if t["short"] and is_put:
+                # A short put that passed expiration with no closing order is either
+                # expired-worthless OR assigned. If the transactions feed shows an
+                # assignment at this (underlying, strike), treat it as assigned and
+                # hand its premium to the shares (Option A).
+                key = (t["ticker"], round(float(t["strike"]), 2)) if t["strike"] is not None else None
+                assigned = bool(t["expired"] and key and assign_budget.get(key, 0.0) >= t["qty"])
+                rec = _build_csp(t, fpc, assigned=assigned)
+                if not rec:
+                    continue
+                csp_closed.append(rec)
+                if assigned and key:
+                    assign_budget[key] -= t["qty"]
+                    slot = assign_premium.setdefault(key, [0.0, 0.0])
+                    slot[0] += rec["creditReceived"] - rec["fees"]  # net premium $
+                    slot[1] += t["qty"] * 100                       # shares assigned
+            elif t["short"] and not is_put:
+                rec = _build_covered_call(t, fpc)    # short call = covered call
+                if rec:
+                    covered_closed.append(rec)
+            elif not t["short"]:
+                rec = _build_leap(t, fpc)            # long call/put = LEAP
+                if rec:
+                    leap_closed.append(rec)
 
         # ---- Stocks: from the TRANSACTIONS feed, with assigned-put premium netted
         #      off the shares' cost basis (contracts-weighted per strike). ----
