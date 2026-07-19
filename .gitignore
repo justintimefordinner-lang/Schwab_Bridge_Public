@@ -11,9 +11,10 @@ credentials*.json
 *.pickle
 *.pkl
 
-# ─── Re-auth (write-only) transient files — never commit ────────
+# ─── App-triggered task inboxes (write-only) — never commit ─────
 .auth_state.json
 reauth_inbox/
+task_inbox/
 
 # ─── Committable templates (re-include these; must come after the rules above) ───
 !.env.example

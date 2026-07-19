@@ -43,6 +43,13 @@ except Exception as _reauth_exc:  # noqa: BLE001
     reauth = None
     print(f"[auto_push] reauth unavailable: {_reauth_exc}", flush=True)
 
+# App-triggered full trade-history rebuild (P&L "Build trade history" button).
+try:
+    import backfill
+except Exception as _backfill_exc:  # noqa: BLE001
+    backfill = None
+    print(f"[auto_push] backfill unavailable: {_backfill_exc}", flush=True)
+
 try:
     from zoneinfo import ZoneInfo
     _ET = ZoneInfo("America/New_York")
@@ -217,6 +224,13 @@ def main() -> None:
                     reauth.process_inbox()
                 except Exception as exc:  # noqa: BLE001
                     _log(f"reauth: inbox error — {exc}")
+
+            # Service an app-triggered full trade-history rebuild (write-only).
+            if backfill is not None:
+                try:
+                    backfill.process(_log)
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"backfill: error — {exc}")
 
             # Daily post-open forced run (e.g. 9:40 ET). Fires once per trading day
             # within the catch window. _run_window() is active only on trading days

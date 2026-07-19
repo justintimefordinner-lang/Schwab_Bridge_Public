@@ -305,13 +305,13 @@ def sync_txns(c, account_hash: str, existing: list[dict[str, Any]], deep: bool =
     return ordered, pulled
 
 
-def main() -> None:
+def main(full: bool = False) -> dict[str, int]:
     load_dotenv()
     import schwab_client as sc
 
     data_dir = _data_dir()
     path = os.path.join(data_dir, HISTORY_FILE)
-    force_full = "--full" in sys.argv
+    force_full = full or ("--full" in sys.argv)
 
     store: dict[str, list[dict[str, Any]]] = {}
     if os.path.exists(path) and not force_full:
@@ -384,6 +384,7 @@ def main() -> None:
         f"Rebuilt closed tabs — CSPs: {counts['csp']}, LEAPs: {counts['leap']}, "
         f"spreads: {counts['spread']}, covered calls: {counts['covered']}, stocks: {counts['stock']}."
     )
+    return counts
 
 
 if __name__ == "__main__":
