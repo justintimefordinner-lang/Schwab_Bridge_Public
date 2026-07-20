@@ -39,6 +39,7 @@ STOCKS_FILE = "stocks-closed.json"
 TXNS_FILE = "transactions.json"
 UNRESOLVED_FILE = "stocks-unresolved.json"     # bridge writes: stock sales needing a manual cost basis
 MANUAL_BASIS_FILE = "manual_cost_basis.json"   # app writes: {orphanId: {"costPerShare": x}}
+MANUAL_SALES_FILE = "manual_stock_sales.json"  # app writes: [{symbol, shares, proceedsPerShare, costPerShare, acquiredDate, soldDate}] — sales predating the feed entirely
 SOURCE_LABEL = "schwab-bridge"
 
 OPEN_INSTRUCTIONS = {"SELL_TO_OPEN", "BUY_TO_OPEN"}
@@ -659,7 +660,8 @@ def _orphan_id(symbol: str, orph: dict[str, Any]) -> str:
 def build_from_history(
     store: dict[str, list[dict[str, Any]]],
     txns_store: dict[str, list[dict[str, Any]]] | None = None,
-    manual_basis: dict[str, float] | None = None,
+    manual_basis: dict[str, dict[str, Any]] | None = None,
+    manual_sales: list[dict[str, Any]] | None = None,
 ) -> dict[str, list]:
     today = datetime.now(timezone.utc).date()
     csp_closed: list[dict[str, Any]] = []
@@ -787,6 +789,21 @@ def build_from_history(
                         "acquiredDate": acq or None,
                     })
 
+    # Fully user-added stock sales (predate the feed entirely, so they never show up
+    # as orphans). Each is a closed long round-trip with a real acquired/sold date.
+    for i, s in enumerate(manual_sales or []):
+        try:
+            t = {"side": "long", "qty": float(s["shares"]),
+                 "open_price": float(s["costPerShare"]), "close_price": float(s["proceedsPerShare"]),
+                 "open_time": s.get("acquiredDate") or "", "close_time": s.get("soldDate") or ""}
+        except (KeyError, TypeError, ValueError):
+            continue
+        rec = _build_stock(t, str(s.get("symbol", "")).upper(), f"manual-{i}")
+        if rec:
+            rec["manualBasis"] = True
+            rec["manualEntry"] = True
+            stock_closed.append(rec)
+
     for lst in (csp_closed, leap_closed, spread_closed, covered_closed, stock_closed):
         lst.sort(key=lambda r: r["closedAt"], reverse=True)
     return {"csp": csp_closed, "leap": leap_closed, "spread": spread_closed, "covered": covered_closed,
@@ -829,10 +846,23 @@ def _load_manual_basis(data_dir: str) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _load_manual_sales(data_dir: str) -> list[dict[str, Any]]:
+    """Fully user-added closed stock sales (predate the feed), written by the app to
+    manual_stock_sales.json as a list of
+    {symbol, shares, proceedsPerShare, costPerShare, acquiredDate, soldDate}."""
+    try:
+        with open(os.path.join(data_dir, MANUAL_SALES_FILE), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
 def write_closed(data_dir: str, store: dict[str, list[dict[str, Any]]]) -> dict[str, int]:
     txns_store = _load_txns(data_dir)
     manual_basis = _load_manual_basis(data_dir)
-    closed = build_from_history(store, txns_store, manual_basis)
+    manual_sales = _load_manual_sales(data_dir)
+    closed = build_from_history(store, txns_store, manual_basis, manual_sales)
     now = datetime.now(timezone.utc).isoformat()
     note = "Options reconstructed from order history (FIFO); stocks from the transactions feed incl. assignment cost basis. Spreads are same-underlying/type/expiration verticals."
 
