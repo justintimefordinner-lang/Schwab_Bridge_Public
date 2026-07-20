@@ -760,21 +760,31 @@ def build_from_history(
                 seen_orphan_ids[oid] = n + 1
                 if n:
                     oid = f"{oid}#{n}"   # identical unmatched sale — keep ids distinct
-                basis = manual_basis.get(oid)
-                if basis is not None:
+                entry = manual_basis.get(oid) or {}
+                cps = entry.get("costPerShare")
+                acq = entry.get("acquiredDate")
+                if cps is not None:
+                    # acquiredDate (when supplied) becomes the real open date, so
+                    # daysHeld and the short/long-term bucket come out correct;
+                    # without it the holding period is unknown → defaults short.
                     t = {"side": orph["side"], "qty": orph["qty"],
-                         "open_price": float(basis), "close_price": orph["close_price"],
-                         "open_time": "", "close_time": orph["close_time"]}
+                         "open_price": float(cps), "close_price": orph["close_price"],
+                         "open_time": acq or "", "close_time": orph["close_time"]}
                     rec = _build_stock(t, sym, oid)
                     if rec:
                         rec["manualBasis"] = True
                         stock_closed.append(rec)
-                else:
+                # Surface for completion when it still lacks a cost basis OR an
+                # acquired date (needed to classify short- vs long-term). Carry the
+                # known cost so the app pre-fills it.
+                if cps is None or not acq:
                     unresolved.append({
                         "id": oid, "symbol": sym, "side": orph["side"],
                         "shares": _round(orph["qty"], 4),
                         "soldAt": _round(orph.get("close_price") or 0.0, 4),
                         "closeDate": (orph.get("close_time") or "")[:10],
+                        "costPerShare": _round(float(cps), 4) if cps is not None else None,
+                        "acquiredDate": acq or None,
                     })
 
     for lst in (csp_closed, leap_closed, spread_closed, covered_closed, stock_closed):
@@ -793,11 +803,14 @@ def _load_txns(data_dir: str) -> dict[str, list[dict[str, Any]]]:
         return {}
 
 
-def _load_manual_basis(data_dir: str) -> dict[str, float]:
-    """User-entered cost bases for stock sales whose purchase predates the feed,
-    keyed by orphan id. Written by the app to manual_cost_basis.json in the data
-    folder; accepts either {id: costPerShare} or {id: {"costPerShare": x}}."""
-    out: dict[str, float] = {}
+def _load_manual_basis(data_dir: str) -> dict[str, dict[str, Any]]:
+    """User-entered basis for stock sales whose purchase predates the feed, keyed by
+    orphan id. Written by the app to manual_cost_basis.json. Accepts a bare number
+    ({id: costPerShare}) or an object ({id: {"costPerShare": x, "acquiredDate": iso}}).
+    acquiredDate (when present) sets the real holding period so the sale can be
+    classified short- vs long-term. Returns {id: {"costPerShare": float,
+    "acquiredDate": str|None}}."""
+    out: dict[str, dict[str, Any]] = {}
     try:
         with open(os.path.join(data_dir, MANUAL_BASIS_FILE), encoding="utf-8") as f:
             data = json.load(f)
@@ -806,9 +819,13 @@ def _load_manual_basis(data_dir: str) -> dict[str, float]:
     if not isinstance(data, dict):
         return out
     for k, v in data.items():
-        cps = v.get("costPerShare") if isinstance(v, dict) else v
+        if isinstance(v, dict):
+            cps = v.get("costPerShare")
+            acq = v.get("acquiredDate")
+        else:
+            cps, acq = v, None
         if isinstance(cps, (int, float)):
-            out[k] = float(cps)
+            out[k] = {"costPerShare": float(cps), "acquiredDate": acq if isinstance(acq, str) and acq else None}
     return out
 
 
