@@ -179,17 +179,20 @@ def _bands_for(sc, c, ticker: str, cache: dict, today_str: str) -> dict | None:
     had (20-day bands barely move day to day) rather than blanking the column, and we
     never cache a None — so a transient price-history hiccup simply retries next push."""
     ent = cache.get(ticker) or {}
-    if ent.get("asof") == today_str and ent.get("bands"):
+    if ent.get("asof") == today_str and ent.get("bands") and ent.get("recent"):
         return ent["bands"]
     bands = None
+    recent = ent.get("recent")  # keep the last good series if this fetch fails
     try:
         closes = [k["close"] for k in sc.get_price_history(c, ticker, days=60)
                   if k.get("close") is not None]
         bands = _bollinger(closes)
+        if closes:
+            recent = [round(float(x), 2) for x in closes[-7:]]  # last 7 trading-day closes
     except Exception as exc:
         print(f"  note: BB bands unavailable for {ticker} ({exc}).")
     if bands:
-        cache[ticker] = {"asof": today_str, "bands": bands}
+        cache[ticker] = {"asof": today_str, "bands": bands, "recent": recent}
         return bands
     # Fetch failed or returned <20 closes — fall back to the last good bands (if any)
     # instead of dropping bbSigma to null, which renders as an empty "—".
@@ -215,6 +218,9 @@ def _enrich_bb(sc, c, account_data: dict, cache: dict, today_str: str) -> None:
         sig = _strike_sigma(e.get("price"), bands)
         if sig is not None:
             e["bbSigma"] = sig
+        recent = (cache.get(e.get("symbol")) or {}).get("recent")
+        if recent and len(recent) >= 2:
+            e["priceHistory"] = recent   # last ~7 daily closes for the expanded mini chart
         for cc in e.get("coveredCalls") or []:
             csig = _strike_sigma(cc.get("strike"), bands)
             if csig is not None:
