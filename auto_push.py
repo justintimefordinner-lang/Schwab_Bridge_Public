@@ -50,6 +50,14 @@ except Exception as _backfill_exc:  # noqa: BLE001
     backfill = None
     print(f"[auto_push] backfill unavailable: {_backfill_exc}", flush=True)
 
+# App-triggered Morning Brief refresh (task_inbox/refresh_report). Optional by
+# design — the push loop keeps running even if this module can't be imported.
+try:
+    import report_refresh
+except Exception as _report_refresh_exc:  # noqa: BLE001
+    report_refresh = None
+    print(f"[auto_push] report_refresh unavailable: {_report_refresh_exc}", flush=True)
+
 try:
     from zoneinfo import ZoneInfo
     _ET = ZoneInfo("America/New_York")
@@ -231,6 +239,13 @@ def main() -> None:
                     backfill.process(_log)
                 except Exception as exc:  # noqa: BLE001
                     _log(f"backfill: error — {exc}")
+
+            # Service an app-triggered Morning Brief rebuild (write-only).
+            if report_refresh is not None:
+                try:
+                    report_refresh.process(_log)
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"report_refresh: error — {exc}")
 
             # Daily post-open forced run (e.g. 9:40 ET). Fires once per trading day
             # within the catch window. _run_window() is active only on trading days
