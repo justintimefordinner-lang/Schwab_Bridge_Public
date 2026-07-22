@@ -172,6 +172,28 @@ def _strike_sigma(strike: float | None, bands: dict | None) -> float | None:
     return round((strike - bands["mid"]) / bands["sd"], 2)
 
 
+def _market_today() -> str:
+    """Today's date in US market time, which is what a daily candle is stamped
+    with. The Pi runs on Mountain time, so its local date is not always the same
+    calendar day as the market's."""
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+
+
+def _candle_date(ts_ms: Any) -> str | None:
+    """Market-time calendar date of a daily candle's epoch-ms timestamp, or None
+    if the candle carries no usable timestamp."""
+    if ts_ms is None:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.fromtimestamp(
+            float(ts_ms) / 1000.0, ZoneInfo("America/New_York")
+        ).date().isoformat()
+    except Exception:
+        return None
+
+
 def _bands_for(sc, c, ticker: str, cache: dict, today_str: str) -> dict | None:
     """20-day bands for one underlying, cached per calendar day so we pull daily
     history at most once per ticker per day (not on every 60s app push). A failed or
@@ -182,17 +204,21 @@ def _bands_for(sc, c, ticker: str, cache: dict, today_str: str) -> dict | None:
     if ent.get("asof") == today_str and ent.get("bands") and ent.get("recent"):
         return ent["bands"]
     bands = None
-    recent = ent.get("recent")  # keep the last good series if this fetch fails
+    recent = ent.get("recent")           # keep the last good series if this fetch fails
+    recent_asof = ent.get("recentAsOf")  # market date of that series' newest candle
     try:
-        closes = [k["close"] for k in sc.get_price_history(c, ticker, days=60)
-                  if k.get("close") is not None]
+        candles = [k for k in sc.get_price_history(c, ticker, days=60)
+                   if k.get("close") is not None]
+        closes = [k["close"] for k in candles]
         bands = _bollinger(closes)
         if closes:
             recent = [round(float(x), 2) for x in closes[-7:]]  # last 7 trading-day closes
+            recent_asof = _candle_date(candles[-1].get("datetime"))
     except Exception as exc:
         print(f"  note: BB bands unavailable for {ticker} ({exc}).")
     if bands:
-        cache[ticker] = {"asof": today_str, "bands": bands, "recent": recent}
+        cache[ticker] = {"asof": today_str, "bands": bands,
+                         "recent": recent, "recentAsOf": recent_asof}
         return bands
     # Fetch failed or returned <20 closes — fall back to the last good bands (if any)
     # instead of dropping bbSigma to null, which renders as an empty "—".
@@ -209,6 +235,7 @@ def _enrich_bb(sc, c, account_data: dict, cache: dict, today_str: str) -> None:
     syms = {o.get("symbol") for o in opts if o.get("symbol") and o.get("strike")}
     syms |= {e.get("symbol") for e in eqs if e.get("symbol") and e.get("price")}
     bands_by_sym = {s: _bands_for(sc, c, s, cache, today_str) for s in syms}
+    mkt_today = _market_today()
     for o in opts:
         sig = _strike_sigma(o.get("strike"), bands_by_sym.get(o.get("symbol")))
         if sig is not None:
@@ -218,9 +245,24 @@ def _enrich_bb(sc, c, account_data: dict, cache: dict, today_str: str) -> None:
         sig = _strike_sigma(e.get("price"), bands)
         if sig is not None:
             e["bbSigma"] = sig
-        recent = (cache.get(e.get("symbol")) or {}).get("recent")
+        ent = cache.get(e.get("symbol")) or {}
+        recent = ent.get("recent")
         if recent and len(recent) >= 2:
-            e["priceHistory"] = recent   # last ~7 daily closes for the expanded mini chart
+            # Daily candles are pulled once per ticker per day, so `recent` ends on a
+            # stale close and an intraday move never reaches the mini chart. Overlay
+            # the live quote as the newest point: replace today's candle when the feed
+            # already has one, otherwise add today on the end. When the live price
+            # still equals the last close (weekend, holiday, pre-open) there is no new
+            # session to show, so the series is left alone.
+            hist = list(recent)
+            live = e.get("price")
+            if live is not None:
+                live = round(float(live), 2)
+                if ent.get("recentAsOf") == mkt_today:
+                    hist[-1] = live
+                elif live != hist[-1]:
+                    hist.append(live)
+            e["priceHistory"] = hist[-7:]   # ~7 trading days, newest = live price
         for cc in e.get("coveredCalls") or []:
             csig = _strike_sigma(cc.get("strike"), bands)
             if csig is not None:
