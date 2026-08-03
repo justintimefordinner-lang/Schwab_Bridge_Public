@@ -443,6 +443,12 @@ def _classify_single_leg(leg: dict[str, Any]) -> tuple[str, float]:
     return "Other", abs(mv)
 
 
+# Schwab assetType values that represent a holding of shares (as opposed to
+# options, cash, fixed income, etc.). ETFs come back as COLLECTIVE_INVESTMENT,
+# so gating "Stock" on EQUITY alone silently drops every ETF position.
+_EQUITY_ASSETS = {"EQUITY", "COLLECTIVE_INVESTMENT", "MUTUAL_FUND"}
+
+
 def classify_positions(raw_positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Parse every position and assign a category + allocation value,
     detecting spreads across the whole account rather than leg by leg.
@@ -527,10 +533,13 @@ def classify_positions(raw_positions: list[dict[str, Any]]) -> list[dict[str, An
             }
         )
 
-    # Equities and anything non-option resolve immediately.
+    # Equities and anything non-option resolve immediately. Schwab reports
+    # ETFs/ETNs/closed-end funds as COLLECTIVE_INVESTMENT (and open-end funds
+    # as MUTUAL_FUND), not EQUITY — all are held as shares, so they belong in
+    # Stock alongside common shares (e.g. the DRAM memory ETF).
     option_legs = []
     for leg in legs:
-        if leg["_asset"] == "EQUITY":
+        if leg["_asset"] in _EQUITY_ASSETS:
             leg["category"] = "Stock"
             leg["alloc_value"] = leg["market_value"] or 0
         elif leg["_asset"] == "OPTION":
@@ -543,7 +552,7 @@ def classify_positions(raw_positions: list[dict[str, Any]]) -> list[dict[str, An
     # as short calls are matched against them.
     cover_remaining: dict[str, int] = {}
     for leg in legs:
-        if leg["_asset"] == "EQUITY":
+        if leg["_asset"] in _EQUITY_ASSETS:
             cover_remaining[leg["ticker"]] = (
                 cover_remaining.get(leg["ticker"], 0) + (leg["_long"] or 0)
             )
