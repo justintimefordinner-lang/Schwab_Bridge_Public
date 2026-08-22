@@ -384,33 +384,32 @@ def map_option(p: dict[str, Any], greeks: dict[str, dict[str, float]], open_date
 
     breakeven = (strike + entry) if not is_put else (strike - entry)
 
-    # Day's change in THIS leg's market value: long gains when the option rises,
-    # a short gains when it falls — so sign by side. netChange is per-share.
+    # Day's change in THIS leg's market value. Schwab's currentDayProfitLoss
+    # (carried as day_pl) is the exact dollar day P&L its own app shows for the
+    # position — already signed for side (a short gains when the option falls) —
+    # so use it directly. It captures vega/IV moves that a greeks estimate can't.
     #
-    # Schwab's option netChange is trustworthy for liquid contracts, but illiquid /
-    # deep-ITM LEAPs often carry a STALE prior close, so their netChange reports a
-    # multi-day intrinsic catch-up (e.g. $53/sh on a name that moved $0.70) — which
-    # blows up Top Movers. Guard against that: an option can't plausibly move more
-    # per share than its delta-implied move (delta × the underlying's day change)
-    # plus a generous vega/theta allowance. When netChange busts that bound (or is
-    # missing), fall back to the delta estimate. Both are "option price change per
-    # share," so the side sign applies to either. delta already encodes call/put.
-    net_ch = g.get("netChange")
-    under_ch = (stock_day or {}).get(p.get("ticker", ""), {}).get("change")
-    vega = g.get("vega")
-    # Delta-implied daily move of the option's price: delta×ΔS plus one day of theta.
-    est = (delta * under_ch + (theta or 0.0)) if (delta is not None and under_ch is not None) else None
-    per_share = net_ch
-    if net_ch is not None and est is not None:
-        slack = abs(vega or 0.0) * 5 + abs(theta or 0.0) + max(0.25, abs(under_ch) * 0.5)
-        if abs(net_ch - est) > slack:
+    # Only when it's absent do we fall back to a greeks estimate: delta×ΔS + one
+    # day of theta, bounding a stale option netChange (illiquid/deep-ITM LEAPs can
+    # report a multi-day intrinsic catch-up — e.g. $53/sh on a name that moved
+    # $0.70 — which would blow up Top Movers). delta already encodes call/put.
+    day_val = p.get("day_pl")
+    if not day_val:
+        net_ch = g.get("netChange")
+        under_ch = (stock_day or {}).get(p.get("ticker", ""), {}).get("change")
+        vega = g.get("vega")
+        est = (delta * under_ch + (theta or 0.0)) if (delta is not None and under_ch is not None) else None
+        per_share = net_ch
+        if net_ch is not None and est is not None:
+            slack = abs(vega or 0.0) * 5 + abs(theta or 0.0) + max(0.10, abs(under_ch) * 0.5)
+            if abs(net_ch - est) > slack:
+                per_share = est
+        elif net_ch is None:
             per_share = est
-    elif net_ch is None:
-        per_share = est
-    day_val = None
-    if per_share is not None and qty:
-        side_sign = -1.0 if side == "short" else 1.0
-        day_val = side_sign * per_share * 100 * qty
+        day_val = None
+        if per_share is not None and qty:
+            side_sign = -1.0 if side == "short" else 1.0
+            day_val = side_sign * per_share * 100 * qty
     # Simulate reference = the underlying the frozen mark/greeks were priced at. Prefer
     # the option quote's own underlyingPrice; fall back to the position's underlying_price.
     # (Never the equity closePrice — that's the PRIOR day and inflates ΔS across sessions.)
