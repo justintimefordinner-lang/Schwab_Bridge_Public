@@ -695,6 +695,26 @@ def _enrich_covered_calls(sc, c, account_data: dict, cache: dict,
                 e["gamma"] = res["gamma"]
 
 
+def _account_labels() -> tuple[dict[str, str], str | None]:
+    """Optional per-account display config from .env, keyed by the account's last 4
+    digits so you never put full account numbers in config:
+
+        ACCOUNT_NICKNAMES=1234:Trading,5678:Roth IRA
+        DEFAULT_ACCOUNT=1234        # which account the app opens on (first load)
+
+    Both optional. Unknown/omitted accounts fall back to their type + masked number,
+    and if DEFAULT_ACCOUNT matches nothing the first linked account stays default."""
+    nicknames: dict[str, str] = {}
+    for pair in (os.environ.get("ACCOUNT_NICKNAMES") or "").split(","):
+        if ":" in pair:
+            last4, name = pair.split(":", 1)
+            last4, name = last4.strip(), name.strip()
+            if last4 and name:
+                nicknames[last4] = name
+    default_last4 = (os.environ.get("DEFAULT_ACCOUNT") or "").strip() or None
+    return nicknames, default_last4
+
+
 def main() -> None:
     # Lazy import so the pure mapping above can be tested without schwab-py.
     from dotenv import load_dotenv
@@ -709,6 +729,10 @@ def main() -> None:
     accounts = sc.list_accounts(c)
     if not accounts:
         raise SystemExit("No linked Schwab accounts found.")
+    nicknames, default_last4 = _account_labels()
+    has_default_match = default_last4 is not None and any(
+        (a.get("number") or "")[-4:] == default_last4 for a in accounts
+    )
 
     history = load_history(data_dir)
     today = date.today().isoformat()
@@ -763,13 +787,17 @@ def main() -> None:
 
         open_dates = closed_trades.open_dates_by_occ(order_store.get(acct_id, []))
 
-        app_accounts.append({
+        entry = {
             "id": acct_id,
             "mask": f"\u2022\u2022\u2022\u2022{last4}",
             "type": (snap.get("account_type") or "margin").lower(),
             "brokerageType": "individual",
-            "isDefault": i == 0,
-        })
+            # Honor DEFAULT_ACCOUNT when it names a real account; otherwise the first.
+            "isDefault": (last4 == default_last4) if has_default_match else (i == 0),
+        }
+        if nicknames.get(last4):
+            entry["nickname"] = nicknames[last4]
+        app_accounts.append(entry)
         data_by_account[acct_id] = build_account_data(snap, greeks, points, open_dates, stock_day)
         _enrich_covered_calls(sc, c, data_by_account[acct_id], cc_cache, cc_now, cc_market_open)
         _enrich_bb(sc, c, data_by_account[acct_id], bb_cache, today)
