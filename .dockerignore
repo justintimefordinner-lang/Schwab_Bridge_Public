@@ -1,0 +1,26 @@
+# Commit as: schwab-bridge/.dockerignore
+#
+# The bridge image only ever COPYs requirements.txt, so this is mostly belt and
+# braces — but it guarantees no credential can reach an image layer even if the
+# Dockerfile is edited later to copy source in.
+
+.git
+.githooks
+
+# Secrets and live state. Bind-mounted at runtime, never built in.
+.env
+.env.*
+credentials.env
+token.json
+.auth_state.json
+reauth_inbox
+task_inbox
+data
+
+.venv
+__pycache__
+*.pyc
+
+README.md
+SECURITY.md
+LICENSE.md
