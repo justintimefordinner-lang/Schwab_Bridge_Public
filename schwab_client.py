@@ -40,6 +40,21 @@ class AuthError(RuntimeError):
     """Raised when the token is missing or can no longer be refreshed."""
 
 
+def quote_price(quote: dict, keys: tuple[str, ...] = ("mark", "lastPrice", "closePrice")) -> float | None:
+    """First positive price among `keys` in a Schwab quote dict.
+
+    Mark first, deliberately: it is the live bid/ask midpoint, whereas lastPrice is
+    the last *print* and can be a stale off-exchange trade that is non-null even
+    when it is badly wrong (seen: a GILD lastPrice of 139.30 against a 145.68
+    mark). Zero or missing marks — indices like $VIX, halted names — fall through
+    to the next key, so ordering mark first never returns a 0."""
+    for key in keys:
+        value = quote.get(key)
+        if value is not None and value > 0:
+            return value
+    return None
+
+
 def get_client() -> client.Client:
     """Build a client from the cached token file.
 
@@ -99,8 +114,9 @@ def list_accounts(c: client.Client) -> list[dict[str, str]]:
 def get_quotes(c: client.Client, symbols: list[str]) -> dict[str, float]:
     """Return {symbol: current price} for the given underlying symbols.
 
-    Uses Schwab's market data quotes endpoint. Price is the last trade,
-    falling back to mark then prior close. Requires the "Market Data
+    Uses Schwab's market data quotes endpoint. Price is the mark (live bid/ask
+    midpoint), falling back to the last trade then prior close — lastPrice can
+    be a stale off-exchange print (see quote_price). Requires the "Market Data
     Production" product on your Schwab app; without it the call fails and
     the caller surfaces that quotes are unavailable.
     """
@@ -113,11 +129,7 @@ def get_quotes(c: client.Client, symbols: list[str]) -> dict[str, float]:
     prices: dict[str, float] = {}
     for sym, payload in data.items():
         quote = (payload or {}).get("quote", {}) or {}
-        price = quote.get("lastPrice")
-        if price is None:
-            price = quote.get("mark")
-        if price is None:
-            price = quote.get("closePrice")
+        price = quote_price(quote)
         if price is not None:
             prices[sym] = price
     return prices
@@ -247,11 +259,7 @@ def get_vix(c: client.Client) -> float | None:
     data = resp.json() or {}
     payload = data.get("$VIX") or data.get("VIX") or {}
     quote = payload.get("quote", {}) or {}
-    for key in ("lastPrice", "mark", "closePrice", "lastPriceInDouble", "last"):
-        value = quote.get(key)
-        if value is not None:
-            return value
-    return None
+    return quote_price(quote, ("mark", "lastPrice", "closePrice", "lastPriceInDouble", "last"))
 
 
 def get_option_thetas(c: client.Client, option_symbols: list[str]) -> dict[str, float]:

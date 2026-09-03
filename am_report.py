@@ -487,10 +487,8 @@ def atm_iv(chain: dict, spot: float | None) -> float | None:
 def build_regime(quotes: dict[str, dict]) -> dict:
     def last(sym):
         q = quotes.get(sym) or {}
-        for key in ("lastPrice", "mark", "closePrice", "last"):
-            if q.get(key) is not None:
-                return float(q[key])
-        return None
+        v = sc.quote_price(q, ("mark", "lastPrice", "closePrice", "last"))
+        return float(v) if v is not None else None
 
     vix = last("$VIX")
     vix3m = last("$VIX3M")
@@ -505,7 +503,7 @@ def build_regime(quotes: dict[str, dict]) -> dict:
     futures = []
     for sym, label in (("/ES", "ES"), ("/NQ", "NQ")):
         q = quotes.get(sym) or {}
-        lastp = q.get("lastPrice") or q.get("mark")
+        lastp = q.get("mark") or q.get("lastPrice")
         prev = q.get("closePrice")
         if lastp and prev:
             futures.append({"sym": label, "pct": round((lastp / prev - 1) * 100, 2)})
@@ -766,12 +764,12 @@ def _stress_interval(c) -> tuple[int, dict]:
 
         def _last(sym: str):
             qq = q.get(sym) or {}
-            return qq.get("lastPrice") or qq.get("mark") or qq.get("closePrice")
+            return qq.get("mark") or qq.get("lastPrice") or qq.get("closePrice")
 
         vix = _last("$VIX")
         vix3m = _last("$VIX3M")
         spyq = q.get("SPY") or {}
-        last, prev = (spyq.get("lastPrice") or spyq.get("mark")), spyq.get("closePrice")
+        last, prev = (spyq.get("mark") or spyq.get("lastPrice")), spyq.get("closePrice")
         if last and prev:
             spy_move = (last / prev - 1) * 100
     except Exception:

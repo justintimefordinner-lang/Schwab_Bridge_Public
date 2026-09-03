@@ -46,11 +46,7 @@ def main() -> None:
             print(f"  MISS  {s:12s} -> not in response (returned keys: {list(data.keys())})")
             continue
         q = (payload or {}).get("quote", {}) or {}
-        last = q.get("lastPrice")
-        if last is None:
-            last = q.get("mark")
-        if last is None:
-            last = q.get("closePrice")
+        last = sc.quote_price(q)
         flag = "OK  " if last is not None else "MISS"
         print(f"  {flag}  {s:12s} -> last={last}  sample fields={sorted(q.keys())[:8]}")
         if last is not None:

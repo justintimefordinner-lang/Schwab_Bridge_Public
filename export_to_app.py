@@ -328,9 +328,8 @@ def fetch_stock_day(c, tickers: list[str]) -> dict[str, dict[str, float | None]]
     out: dict[str, dict[str, float | None]] = {}
     for sym, payload in data.items():
         q = (payload or {}).get("quote", {}) or {}
-        last = q.get("lastPrice")
-        if last is None:
-            last = q.get("mark")
+        # Mark first: lastPrice can be a stale off-exchange print (see sc.quote_price).
+        last = q.get("mark") or q.get("lastPrice")
         # Regular-session close = the price the frozen option marks correspond to;
         # `last` keeps moving after hours. Their gap is the ΔS the Simulate toggle uses.
         reg_close = q.get("regularMarketLastPrice")
