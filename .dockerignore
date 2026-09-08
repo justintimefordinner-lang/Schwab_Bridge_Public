@@ -1,26 +1,48 @@
 # Commit as: schwab-bridge/.dockerignore
 #
-# The bridge image only ever COPYs requirements.txt, so this is mostly belt and
-# braces — but it guarantees no credential can reach an image layer even if the
-# Dockerfile is edited later to copy source in.
+# NOW LOAD-BEARING. The release Dockerfile does `COPY . /opt/bridge`, so these
+# exclusions are the only thing keeping credentials and live state out of a
+# published image layer. Anything you add to this repo that holds a secret must
+# be listed below. (Previously the image copied only requirements.txt and this
+# file was belt-and-braces; that is no longer true.) Treat every edit to this
+# file as a security change.
 
 .git
 .githooks
+.pre-commit-config.yaml
 
-# Secrets and live state. Bind-mounted at runtime, never built in.
+# Secrets and live state. Live on the host at /state, never in the image.
 .env
 .env.*
 credentials.env
+credentials.env.*
 token.json
+tokens.json
 .auth_state.json
 reauth_inbox
 task_inbox
 data
 
+# Anything else that could hold a secret or account data (mirrors .gitignore).
+client_secret*.json
+credentials*.json
+service_account*.json
+*.pem
+*.pickle
+*.pkl
+*.bak
+*.log
+
+# Personal notes and scratch text next to a live checkout. requirements.txt
+# is the one .txt the build needs.
+*.txt
+!requirements.txt
+
 .venv
 __pycache__
 *.pyc
 
+# Docs don't affect the build.
 README.md
 SECURITY.md
 LICENSE.md
