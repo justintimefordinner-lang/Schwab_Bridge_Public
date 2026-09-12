@@ -885,15 +885,29 @@ def main() -> None:
         # Secondary CBOE indices for the indicator panel — all proven to quote on
         # this account (probe_indices.py: VIX3M/VIX9D/VVIX/SKEW all returned). One
         # batched quote call; each is independent, so a missing one stays None.
-        vix3m = vix9d = vvix = skew = None
+        # $VXN (Nasdaq-100 vol) rides along for the app's VIX/VXN divergence read;
+        # a missing quote just leaves it None and the app hides the VXN section.
+        vix3m = vix9d = vvix = skew = vxn = None
         try:
-            idx = sc.get_quotes(c, ["$VIX3M", "$VIX9D", "$VVIX", "$SKEW"])
+            idx = sc.get_quotes(c, ["$VIX3M", "$VIX9D", "$VVIX", "$SKEW", "$VXN"])
             vix3m = idx.get("$VIX3M")
             vix9d = idx.get("$VIX9D")
             vvix = idx.get("$VVIX")
             skew = idx.get("$SKEW")
+            vxn = idx.get("$VXN")
         except Exception as exc:
             print(f"  note: secondary vol indices unavailable ({exc}).")
+        if vxn is None:
+            # Schwab's feed may not carry $VXN on every account; fall back to
+            # Yahoo's ^VXN last close (already a dependency, cached by yfinance).
+            try:
+                import yfinance as yf
+                hist = yf.Ticker("^VXN").history(period="5d", interval="1d", auto_adjust=False)
+                if hist is not None and not hist.empty:
+                    vxn = round(float(hist["Close"].dropna().iloc[-1]), 2)
+                    print("  note: $VXN not quoted by Schwab; using Yahoo ^VXN last close.")
+            except Exception as exc:
+                print(f"  note: VXN unavailable ({exc}).")
         # S5FI ($SPXA50R = S&P 500 % above their 50-day SMA). Schwab's feed doesn't
         # carry the breadth symbol, so compute it from the 500 constituents via
         # yfinance (cached daily). The app classifies the bands + weekly-slope trend.
@@ -940,6 +954,7 @@ def main() -> None:
             "inputs": {
                 "vix": vix_level,
                 "vix9d": vix9d, "vix3m": vix3m, "vvix": vvix, "skew": skew,
+                "vxn": vxn,
                 "s5fi": s5fi, "s5fiSlopeWk": s5fi_slope_wk, "s5fiWeekly": s5fi_weekly,
                 "mes": mes, "mesSlopeDay": mes_slope_day, "mesDaily": mes_daily,
                 "realizedVol20": rv20, "realizedVol30": None,
