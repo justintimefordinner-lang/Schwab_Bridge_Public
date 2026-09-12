@@ -828,6 +828,22 @@ def main() -> None:
                       f"mark={mark} Δ={d} Γ={g} V={opt.get('vega')} ΔV/sh={_round(dv, 4) if dv is not None else None} "
                       f"projMark={_round(proj) if proj is not None else None}{flags}")
 
+    # Ticker → sector map for the dashboard's Portfolio Risk screen (data/sectors.json).
+    # Schwab has no sector field, so sectors.py fills this from Yahoo: a few cold
+    # lookups per run, cached for months. Every held stock plus every option
+    # underlying, so CSP collateral gets a sector too.
+    try:
+        import sectors as _sectors
+        risk_tickers = sorted({
+            sym
+            for d in data_by_account.values()
+            for sym in ([e["symbol"] for e in d["equities"]] + [o["symbol"] for o in d["options"]])
+            if sym
+        })
+        _sectors.refresh_sectors(data_dir, risk_tickers)
+    except Exception as exc:
+        print(f"  note: sector lookup skipped ({exc}).")
+
     try:
         with open(os.path.join(data_dir, BB_CACHE_FILE), "w", encoding="utf-8") as f:
             json.dump(bb_cache, f)

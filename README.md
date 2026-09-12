@@ -115,6 +115,7 @@ browser and copy the fresh `token.json` over, then restart the service.)
 | `auto_push.py`          | Main loop — pushes data + services the re-auth inbox     |
 | `schwab_client.py`      | Read-only Schwab data layer (balances, positions, orders)|
 | `export_to_app.py`      | Writes the dashboard JSON snapshot                       |
+| `sectors.py`            | Ticker → sector cache (`data/sectors.json`) from Yahoo   |
 | `sync_trade_history.py` | Builds trade / transaction history                       |
 | `app.py`                | Optional standalone Streamlit view                       |
 
