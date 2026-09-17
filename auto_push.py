@@ -132,6 +132,7 @@ _ENV_KEY_FOR_LABEL = {
     "research": "RESEARCH_PUSH_INTERVAL",
     "am_report": "AM_REPORT_PUSH_INTERVAL",
     "am_ladder": "AM_LADDER_PUSH_INTERVAL",
+    "manual": "MANUAL_PUSH_INTERVAL",
 }
 
 
@@ -159,12 +160,19 @@ def main() -> None:
     research_interval = _interval("RESEARCH_PUSH_INTERVAL", 900)
     am_report_interval = _interval("AM_REPORT_PUSH_INTERVAL", 1800)
     am_ladder_interval = _interval("AM_LADDER_PUSH_INTERVAL", 300)
+    manual_interval = _interval("MANUAL_PUSH_INTERVAL", app_interval)
 
     # Each target: [label, callable, interval_seconds, next_run_epoch].
     targets: list[list] = []
     if app_interval > 0:
         import export_to_app
         targets.append(["app", export_to_app.main, app_interval, 0.0])
+    if manual_interval > 0:
+        # Hand-entered positions (other brokers), priced with Schwab market data each
+        # cycle into data/manual/snapshot.json — see manual_positions.py. Cheap: two
+        # quote calls, and a no-op when nothing has been entered.
+        import manual_positions
+        targets.append(["manual", manual_positions.main, manual_interval, 0.0])
     if history_interval > 0:
         # Rolling order/txn sync + closed-trade rebuild. Runs a light 2-day pull
         # each tick (deep backfill only on first run or `sync_trade_history.py --full`).
