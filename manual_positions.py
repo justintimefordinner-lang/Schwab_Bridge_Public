@@ -151,6 +151,50 @@ def categorize(stocks: list[dict], options: list[dict]) -> dict[str, str]:
     return cats
 
 
+# --- valuation ---------------------------------------------------------------
+def _leg_pnl(row: dict[str, Any]) -> float:
+    """Unrealized $ P/L of one mapped option row (long: mark − entry; short:
+    entry − mark), per contract × 100 × qty. Mirrors lib/calc optionPnl."""
+    entry = row.get("entryPerShare") or 0.0
+    mark = row.get("mark") or 0.0
+    qty = row.get("qty") or 0
+    per_share = (mark - entry) if row.get("side") == "long" else (entry - mark)
+    return per_share * 100 * qty
+
+
+def structured_options_value(rows: list[dict[str, Any]]) -> float:
+    """The options book valued by capital tied up, the same way the dashboard's
+    Options page does (OptionsSummarySim.structuredValue):
+        CSP            → collateral (strike × 100 × qty) + its P/L
+        LEAP / hedge   → market value (long assets)
+        covered call   → its P/L only (the shares carry the capital)
+        vertical       → defined risk (strike width × 100 × contracts) + P/L
+        anything else  → market value if long, P/L if short
+    A short put is therefore never a negative number here."""
+    total = 0.0
+    spreads: dict[tuple, list[dict[str, Any]]] = {}
+    for r in rows:
+        kind = r.get("kind")
+        if kind == "csp":
+            total += (r.get("strike") or 0.0) * 100 * (r.get("qty") or 0) + _leg_pnl(r)
+        elif kind in ("leap-call", "leap-put-hedge"):
+            total += (r.get("mark") or 0.0) * 100 * (r.get("qty") or 0)
+        elif kind == "covered-call":
+            total += _leg_pnl(r)
+        elif kind in ("put-spread", "call-spread"):
+            spreads.setdefault((r.get("symbol"), r.get("optionType"), r.get("expiration")), []).append(r)
+        elif r.get("side") == "long":
+            total += (r.get("mark") or 0.0) * 100 * (r.get("qty") or 0)
+        else:
+            total += _leg_pnl(r)
+    for legs in spreads.values():
+        strikes = [leg.get("strike") or 0.0 for leg in legs]
+        width = max(strikes) - min(strikes) if len(strikes) > 1 else 0.0
+        contracts = min(leg.get("qty") or 0 for leg in legs) if legs else 0
+        total += width * 100 * contracts + sum(_leg_pnl(leg) for leg in legs)
+    return total
+
+
 # --- earnings dates (only for tickers the roster feed hasn't covered) ---------
 def _fill_missing_earnings(data_dir: str, tickers: list[str]) -> None:
     path = os.path.join(data_dir, EARNINGS_FILE)
@@ -259,10 +303,12 @@ def main() -> None:
             opts.append(row)
 
         equity_value = sum((e["qty"] or 0) * (e["price"] or 0) for e in equities)
-        options_net = sum(
-            (r["mark"] or 0) * 100 * r["qty"] * (1 if r["side"] == "long" else -1) for r in opts
-        )
-        total = cash + equity_value + options_net
+        options_value = structured_options_value(opts)
+        # The account's value the way the rest of the app frames it: free cash
+        # (the `cash` the user entered — beyond what secures the puts) + shares
+        # + options by capital tied up. A short put counts as its collateral
+        # plus its P/L, never as a negative buy-back liability.
+        total = cash + equity_value + options_value
         points = ex.update_history(history, acct_id, total, today)
 
         app_accounts.append({
@@ -277,7 +323,7 @@ def main() -> None:
             "summary": {
                 "totalValue": ex._round(total),
                 "equityValue": ex._round(equity_value),
-                "optionsValue": ex._round(options_net),
+                "optionsValue": ex._round(options_value),
                 "cryptoValue": 0.0,
                 "cash": ex._round(cash),
                 "buyingPower": ex._round(cash),
