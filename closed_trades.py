@@ -44,6 +44,143 @@ SOURCE_LABEL = "schwab-bridge"
 
 OPEN_INSTRUCTIONS = {"SELL_TO_OPEN", "BUY_TO_OPEN"}
 CLOSE_INSTRUCTIONS = {"BUY_TO_CLOSE", "SELL_TO_CLOSE"}
+_EQUITY_ORDER_INSTRUCTIONS = {"BUY", "SELL", "SELL_SHORT", "BUY_TO_COVER"}
+
+
+# ---------------------------------------------------------------------------
+# Order records synthesized from the TRANSACTIONS feed.
+#
+# The order store can miss fills: a backfill window that errored used to end the
+# whole walk, and a multi-day sync gap can outrun the rolling window. Each fill
+# still shows up as a TRADE transaction, which carries everything a round-trip
+# needs — the OCC symbol, signed quantity, price, OPENING/CLOSING and the
+# orderId. So any orderId present in the transactions but absent from the order
+# store is rebuilt here in parse_record's shape and fed to the same FIFO. That
+# is what turns a "put expired, kept the whole credit" into the buy-to-close it
+# really was.
+# ---------------------------------------------------------------------------
+def _occ_parts(occ: str) -> tuple[float | None, str | None]:
+    """(strike, expiration ISO) from an OCC symbol like 'SOFI  261009P00016000';
+    (None, None) when it doesn't parse. Local copy of schwab_client's helpers so
+    this module stays free of API imports."""
+    import re
+    m = re.search(r"(\d{6})([CP])(\d{8})$", (occ or "").replace(" ", ""))
+    if not m:
+        return None, None
+    try:
+        exp = datetime.strptime(m.group(1), "%y%m%d").date().isoformat()
+    except ValueError:
+        exp = None
+    return int(m.group(3)) / 1000.0, exp
+
+
+def _instruction_from_txn(position_effect: str, amount: float) -> str:
+    pe = (position_effect or "").upper()
+    if pe == "OPENING":
+        return "BUY_TO_OPEN" if amount > 0 else "SELL_TO_OPEN"
+    if pe == "CLOSING":
+        return "BUY_TO_CLOSE" if amount > 0 else "SELL_TO_CLOSE"
+    return "BUY_TO_OPEN" if amount > 0 else "SELL_TO_CLOSE"
+
+
+def _orders_from_txns(txns: list[dict[str, Any]], known_order_ids: set[Any]) -> list[dict[str, Any]]:
+    """Option orders present in the transactions feed but not in the order store,
+    rebuilt as order records. Multi-fill orders (several TRADE records under one
+    orderId) collapse into one record with volume-weighted leg prices."""
+    by_order: dict[Any, dict[str, Any]] = {}
+    for t in txns:
+        if (t.get("type") or "").upper() != "TRADE":
+            continue
+        oid = t.get("orderId")
+        if oid is None or oid in known_order_ids:
+            continue
+        when = t.get("time") or t.get("tradeDate") or ""
+        for ti in t.get("transferItems", []) or []:
+            instr = ti.get("instrument") or {}
+            if (instr.get("assetType") or "").upper() != "OPTION":
+                continue
+            occ = instr.get("symbol")
+            amount = ti.get("amount") or 0
+            price = ti.get("price")
+            if not occ or not amount or price is None:
+                continue
+            rec = by_order.setdefault(oid, {"orderId": oid, "enteredTime": when, "closeTime": when,
+                                            "status": "FILLED", "orderType": "", "quantity": None,
+                                            "filledQuantity": None, "price": None, "fillPrice": None,
+                                            "symbol": instr.get("underlyingSymbol") or "", "instruction": "",
+                                            "legs": [], "_legs": {}, "synthesized": True})
+            if when and when > rec["closeTime"]:
+                rec["closeTime"] = when
+            if when and when < rec["enteredTime"]:
+                rec["enteredTime"] = when
+            instruction = _instruction_from_txn(ti.get("positionEffect") or "", amount)
+            key = (occ, instruction)
+            leg = rec["_legs"].get(key)
+            if leg is None:
+                occ_strike, occ_exp = _occ_parts(occ)
+                strike = instr.get("strikePrice")
+                if strike is None:
+                    strike = occ_strike
+                exp = (instr.get("expirationDate") or "")[:10] or occ_exp or ""
+                leg = {
+                    "instruction": instruction,
+                    "positionEffect": (ti.get("positionEffect") or "").upper(),
+                    "quantity": 0.0, "_notional": 0.0,
+                    "assetType": "OPTION", "symbol": occ, "legId": len(rec["_legs"]) + 1,
+                    "fillPrice": None,
+                    "ticker": instr.get("underlyingSymbol") or "",
+                    "putCall": (instr.get("putCall") or "").upper(),
+                    "strike": float(strike) if strike is not None else None,
+                    "expiration": exp or None,
+                }
+                rec["_legs"][key] = leg
+            leg["quantity"] += abs(amount)
+            leg["_notional"] += abs(amount) * float(price)
+    out: list[dict[str, Any]] = []
+    for rec in by_order.values():
+        legs = list(rec.pop("_legs").values())
+        for leg in legs:
+            leg["fillPrice"] = leg["_notional"] / leg["quantity"] if leg["quantity"] else None
+            del leg["_notional"]
+        if not legs:
+            continue
+        rec["legs"] = legs
+        rec["instruction"] = legs[0]["instruction"]
+        rec["fillPrice"] = legs[0]["fillPrice"] if len(legs) == 1 else None
+        out.append(rec)
+    return out
+
+
+def _equity_events_from_orders(orders: list[dict[str, Any]], skip_order_ids: set[Any]) -> dict[str, list[dict[str, Any]]]:
+    """Stock buys/sells from the ORDER store, for orders the transactions feed
+    doesn't cover (it reaches back ~60 days; orders go back much further). Only
+    orders whose id is NOT in the transactions feed are used, so a fill is never
+    counted from both sources. Assignments don't appear here — they have no order.
+    Same event shape as _equity_events_from_txns."""
+    by_sym: dict[str, list[dict[str, Any]]] = {}
+    for o in orders:
+        oid = o.get("orderId")
+        if oid is None or oid in skip_order_ids:
+            continue
+        legs = o.get("legs", []) or []
+        for leg in legs:
+            if (leg.get("assetType") or "").upper() not in _EQUITY_ASSET_TYPES:
+                continue
+            instruction = (leg.get("instruction") or "").upper()
+            if instruction not in _EQUITY_ORDER_INSTRUCTIONS:
+                continue
+            sym = leg.get("symbol")
+            qty = abs(leg.get("quantity") or 0)
+            price = leg.get("fillPrice")
+            if price is None and len(legs) == 1:
+                price = o.get("fillPrice")
+            if not sym or not qty or price is None:
+                continue
+            by_sym.setdefault(sym, []).append({
+                "time": o.get("closeTime") or o.get("enteredTime") or "",
+                "instruction": instruction, "qty": qty, "price": float(price), "order_id": oid,
+            })
+    return by_sym
 
 
 def _data_dir() -> str:
@@ -303,7 +440,7 @@ def _spread_partners(records: list[dict[str, Any]]) -> tuple[set[str], set[tuple
     return spread_occs, pairs
 
 
-def _build_covered_call(t: dict[str, Any], fpc: Callable[[Any], float] = _no_fee) -> dict[str, Any] | None:
+def _build_covered_call(t: dict[str, Any], fpc: Callable[[Any], float] = _no_fee, assigned: bool = False) -> dict[str, Any] | None:
     credit = t["open_price"]
     close_px = t["close_price"]
     strike = t["strike"]
@@ -317,7 +454,15 @@ def _build_covered_call(t: dict[str, Any], fpc: Callable[[Any], float] = _no_fee
     notional = strike * 100 * qty
     days = _days_held(t["open_time"], t["close_time"])
     ret = realized / notional if notional else 0.0
-    outcome = "expired" if t["expired"] else ("closed_profit" if realized >= 0 else "closed_loss")
+    if assigned:
+        # Called away: the premium is added to the shares' sale proceeds (see
+        # build_from_history), the way Schwab reports it — the call itself books
+        # no realized gain, otherwise the premium counts twice.
+        outcome = "assigned"
+        realized = 0.0
+        ret = 0.0
+    else:
+        outcome = "expired" if t["expired"] else ("closed_profit" if realized >= 0 else "closed_loss")
     return {
         "id": f"{t['ticker']}-{strike}C-{t['expiration']}-{t['open_time'][:10]}",
         "symbol": t["ticker"], "name": t["ticker"],
@@ -417,17 +562,27 @@ def _is_assignment(txn: dict[str, Any]) -> bool:
     return "assignment" in (txn.get("description") or "").lower()
 
 
-def _equity_events_from_txns(records: list[dict[str, Any]], prem_per_share: dict[tuple[str, float], float] | None = None) -> dict[str, list[dict[str, Any]]]:
+def _equity_events_from_txns(records: list[dict[str, Any]], prem_per_share: dict[tuple[str, float, str], float] | None = None) -> dict[str, list[dict[str, Any]]]:
     """Per-symbol chronological equity events from the TRANSACTIONS feed.
 
     Two sources, so assignment cost basis is captured (orders miss it):
       • TRADE with an EQUITY/ETF item → a real buy/sell. positionEffect + the
-        sign of `amount` give open/close and long/short.
-      • RECEIVE_AND_DELIVER with an OPTION item → an assignment. A PUT assignment
-        means shares were put to you (BUY at strike); a CALL assignment means
-        shares were called away (SELL at strike). Strike = cost/sale basis.
+        sign of `amount` give open/close and long/short. Schwab posts the shares
+        an assignment moves as one of these too: a TRADE with NO orderId at
+        exactly the strike (verified against a Schwab lot report). That is the
+        authoritative record of the assignment — real date, real share count.
+      • RECEIVE_AND_DELIVER with an OPTION item → the assignment's option-removal
+        side. It used to ALSO become a share event, which double-booked every
+        assignment (500 shares bought at the netted price AND 500 at the raw
+        strike), so FIFO later sold against phantom raw-strike lots and showed
+        losses Schwab never had. Now it only supplies what the TRADE lacks —
+        which strike's premium to net off the shares — and creates a share
+        event itself only when no matching no-orderId TRADE exists (older feeds).
     """
     by_sym: dict[str, list[dict[str, Any]]] = {}
+    # Assignment share movements from the TRADE side: (symbol, strike, qty) → events,
+    # so the RECEIVE_AND_DELIVER pass below can claim (and price) them.
+    strike_trades: dict[tuple[str, float], list[dict[str, Any]]] = {}
     for t in records:
         ttype = (t.get("type") or "").upper()
         when = t.get("tradeDate") or t.get("time") or ""
@@ -449,35 +604,63 @@ def _equity_events_from_txns(records: list[dict[str, Any]], prem_per_share: dict
                     instruction = "SELL" if amount < 0 else "BUY_TO_COVER"
                 else:  # fall back to sign
                     instruction = "BUY" if amount > 0 else "SELL"
-                by_sym.setdefault(sym, []).append(
-                    {"time": when, "instruction": instruction, "qty": abs(amount), "price": price, "order_id": oid}
-                )
+                ev = {"time": when, "instruction": instruction, "qty": abs(amount), "price": float(price), "order_id": oid}
+                by_sym.setdefault(sym, []).append(ev)
+                if oid is None:
+                    strike_trades.setdefault((sym, round(float(price), 2)), []).append(ev)
 
-            elif ttype == "RECEIVE_AND_DELIVER" and atype == "OPTION":
-                if not _is_assignment(t):
-                    continue   # expiration removal — the option is gone but no shares moved
-                pc = (instr.get("putCall") or "").upper()
-                strike = instr.get("strikePrice")
-                underlying = instr.get("underlyingSymbol")
-                contracts = abs(ti.get("amount") or 0)
-                deliverables = instr.get("optionDeliverables") or []
-                per = (deliverables[0].get("deliverableUnits") if deliverables else None) \
-                    or instr.get("optionPremiumMultiplier") or 100
-                shares = contracts * per
-                if not underlying or strike is None or shares <= 0 or pc not in ("PUT", "CALL"):
+    for t in records:
+        if (t.get("type") or "").upper() != "RECEIVE_AND_DELIVER":
+            continue
+        if not _is_assignment(t):
+            continue   # expiration removal — the option is gone but no shares moved
+        when = t.get("tradeDate") or t.get("time") or ""
+        oid = t.get("orderId")
+        for ti in t.get("transferItems", []) or []:
+            instr = ti.get("instrument") or {}
+            if (instr.get("assetType") or "").upper() != "OPTION":
+                continue
+            pc = (instr.get("putCall") or "").upper()
+            strike = instr.get("strikePrice")
+            underlying = instr.get("underlyingSymbol")
+            contracts = abs(ti.get("amount") or 0)
+            deliverables = instr.get("optionDeliverables") or []
+            per = (deliverables[0].get("deliverableUnits") if deliverables else None) \
+                or instr.get("optionPremiumMultiplier") or 100
+            shares = contracts * per
+            if not underlying or strike is None or shares <= 0 or pc not in ("PUT", "CALL"):
+                continue
+            skey = (underlying, round(float(strike), 2))
+            prem = (prem_per_share or {}).get((underlying, round(float(strike), 2), pc), 0.0)
+            # Option A: the matched option's premium lives in the shares rather than
+            # being double-counted as a realized option gain — a put's premium comes
+            # OFF the cost basis, a called-away call's premium goes ON the sale
+            # proceeds. prem is 0.0 when no assigned option was matched.
+            netted = float(strike) - prem if pc == "PUT" else float(strike) + prem
+            # Claim the TRADE-side share movement(s) for this assignment: the same
+            # symbol at exactly the strike, no orderId, until the contracts' shares
+            # are covered. Price those events at the netted figure; add nothing.
+            remaining = shares
+            for ev in strike_trades.get(skey, []):
+                if remaining <= 0:
+                    break
+                if ev.get("_claimed"):
                     continue
-                # PUT assigned → buy shares at strike; CALL assigned → sell at strike.
-                # Option A: for puts, net the collected premium off the cost basis so
-                # the wheel's premium lives in the shares rather than being double-
-                # counted as a realized CSP gain. prem_per_share carries the matched
-                # put premium per share (0.0 when not linked to an assigned put).
-                instruction = "BUY" if pc == "PUT" else "SELL"
-                price = strike
-                if pc == "PUT" and prem_per_share:
-                    price = strike - prem_per_share.get((underlying, round(float(strike), 2)), 0.0)
+                want = "BUY" if pc == "PUT" else "SELL"
+                if ev["instruction"] != want:
+                    continue
+                ev["_claimed"] = True
+                ev["price"] = netted
+                remaining -= ev["qty"]
+            if remaining > 0:
+                # No TRADE-side record (older feeds) — fall back to the old behaviour.
                 by_sym.setdefault(underlying, []).append(
-                    {"time": when, "instruction": instruction, "qty": shares, "price": price, "order_id": oid}
+                    {"time": when, "instruction": "BUY" if pc == "PUT" else "SELL",
+                     "qty": remaining, "price": netted, "order_id": oid}
                 )
+    for evs in by_sym.values():
+        for ev in evs:
+            ev.pop("_claimed", None)
     # Collapse multi-fill orders: one sell/buy order can fill in several lots, each
     # arriving as its own transaction under a shared orderId. Merge them so a
     # 1,000-share order that filled 934 + 66 is one 1,000-share event, not two.
@@ -622,28 +805,31 @@ def _fee_index_by_order(txns_store: dict[str, list[dict[str, Any]]] | None) -> d
     return idx
 
 
-def _put_assignment_contracts(records: list[dict[str, Any]]) -> dict[tuple[str, float], float]:
-    """From one account's TRANSACTIONS feed: total PUT-assignment contracts per
-    (underlying, strike). Lets us tell which expired short puts were actually
-    assigned (vs expired worthless), so their premium can be folded into the
-    shares instead of double-counted as a realized CSP gain (Option A)."""
-    out: dict[tuple[str, float], float] = {}
+def _assignment_contracts(records: list[dict[str, Any]]) -> dict[tuple[str, float, str], float]:
+    """From one account's TRANSACTIONS feed: total assigned contracts per
+    (underlying, strike, 'PUT'|'CALL'). Lets us tell which expired short options
+    were actually assigned (vs expired worthless): an assigned put's premium is
+    folded into the shares' cost basis, an assigned (called-away) call's premium
+    into the shares' sale proceeds — Schwab's convention — instead of being
+    double-counted as a realized option gain."""
+    out: dict[tuple[str, float, str], float] = {}
     for t in records:
         if (t.get("type") or "").upper() != "RECEIVE_AND_DELIVER":
             continue
         if not _is_assignment(t):
-            continue   # expired put, not assigned — no shares, no premium to fold
+            continue   # expired, not assigned — no shares, no premium to fold
         for ti in t.get("transferItems", []) or []:
             instr = ti.get("instrument") or {}
             if (instr.get("assetType") or "").upper() != "OPTION":
                 continue
-            if (instr.get("putCall") or "").upper() != "PUT":
+            pc = (instr.get("putCall") or "").upper()
+            if pc not in ("PUT", "CALL"):
                 continue
             strike = instr.get("strikePrice")
             underlying = instr.get("underlyingSymbol")
             contracts = abs(ti.get("amount") or 0)
             if underlying and strike is not None and contracts > 0:
-                key = (underlying, round(float(strike), 2))
+                key = (underlying, round(float(strike), 2), pc)
                 out[key] = out.get(key, 0.0) + contracts
     return out
 
@@ -691,15 +877,23 @@ def build_from_history(
     # feed) can hand its premium to its shares (transactions feed) within the
     # same account.
     for aid in set(store) | set(txns_store):
-        orders = store.get(aid, [])
+        orders = list(store.get(aid, []))
         txns = txns_store.get(aid, [])
+        # Fills the order sync missed but the transactions feed has: rebuild them
+        # as orders so their closes count (see _orders_from_txns).
+        known_ids = {o.get("orderId") for o in orders if o.get("orderId") is not None}
+        recovered = _orders_from_txns(txns, known_ids)
+        if recovered:
+            print(f"  recovered {len(recovered)} option orders from the transactions feed")
+            orders.extend(recovered)
+        txn_order_ids = {t.get("orderId") for t in txns if t.get("orderId") is not None}
 
         # PUT contracts assigned per (underlying, strike); we draw from this budget
         # to decide which expired short puts were assigned.
-        assign_budget = _put_assignment_contracts(txns)
-        # Net premium of the puts we mark assigned, to fold into those shares' cost
-        # basis: {(underlying, strike): [net_premium_dollars, shares]}.
-        assign_premium: dict[tuple[str, float], list[float]] = {}
+        assign_budget = _assignment_contracts(txns)
+        # Net premium of the options we mark assigned, to fold into those shares'
+        # basis (puts) or proceeds (calls): {(underlying, strike, pc): [net_premium_dollars, shares]}.
+        assign_premium: dict[tuple[str, float, str], list[float]] = {}
 
         # ---- Options: from the ORDERS feed ----
         spread_occs, pairs = _spread_partners(orders)
@@ -725,7 +919,7 @@ def build_from_history(
                 # expired-worthless OR assigned. If the transactions feed shows an
                 # assignment at this (underlying, strike), treat it as assigned and
                 # hand its premium to the shares (Option A).
-                key = (t["ticker"], round(float(t["strike"]), 2)) if t["strike"] is not None else None
+                key = (t["ticker"], round(float(t["strike"]), 2), "PUT") if t["strike"] is not None else None
                 assigned = bool(t["expired"] and key and assign_budget.get(key, 0.0) >= t["qty"])
                 rec = _build_csp(t, fpc, assigned=assigned)
                 if not rec:
@@ -737,9 +931,19 @@ def build_from_history(
                     slot[0] += rec["creditReceived"] - rec["fees"]  # net premium $
                     slot[1] += t["qty"] * 100                       # shares assigned
             elif t["short"] and not is_put:
-                rec = _build_covered_call(t, fpc)    # short call = covered call
-                if rec:
-                    covered_closed.append(rec)
+                # A short call that passed expiration with no closing order was either
+                # expired-worthless or called away. Same test as the puts above.
+                key = (t["ticker"], round(float(t["strike"]), 2), "CALL") if t["strike"] is not None else None
+                assigned = bool(t["expired"] and key and assign_budget.get(key, 0.0) >= t["qty"])
+                rec = _build_covered_call(t, fpc, assigned=assigned)    # short call = covered call
+                if not rec:
+                    continue
+                covered_closed.append(rec)
+                if assigned and key:
+                    assign_budget[key] -= t["qty"]
+                    slot = assign_premium.setdefault(key, [0.0, 0.0])
+                    slot[0] += rec["creditReceived"] - rec["fees"]  # net premium $
+                    slot[1] += t["qty"] * 100                       # shares called away
             elif not t["short"]:
                 rec = _build_leap(t, fpc)            # long call/put = LEAP
                 if rec:
@@ -750,7 +954,13 @@ def build_from_history(
         #      purchase predates the feed get a user-entered basis if one is on file,
         #      otherwise they're surfaced as "unresolved" for the app to prompt. ----
         prem_per_share = {k: (v[0] / v[1] if v[1] else 0.0) for k, v in assign_premium.items()}
-        for sym, evs in _equity_events_from_txns(txns, prem_per_share).items():
+        equity_events = _equity_events_from_txns(txns, prem_per_share)
+        # Stock fills older than the transactions feed reaches come from the order
+        # store instead (orders whose id the feed doesn't carry). Both sources feed
+        # one FIFO per symbol, so a January buy can match an August sale.
+        for sym, evs in _equity_events_from_orders(orders, txn_order_ids).items():
+            equity_events.setdefault(sym, []).extend(evs)
+        for sym, evs in equity_events.items():
             rts, orphans = _equity_round_trips(evs)
             for i, t in enumerate(rts):
                 rec = _build_stock(t, sym, i)
