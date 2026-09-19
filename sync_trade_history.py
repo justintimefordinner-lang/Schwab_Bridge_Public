@@ -65,7 +65,13 @@ def mask_pii(obj: Any) -> Any:
     return obj
 
 
-TXN_LOOKBACK_DAYS = 58        # transactions API only allows ~60 days back per request
+# How far back a deep (first-run / --full) transactions sync walks. The API caps
+# each REQUEST at about 60 days of span, not the lookback, so the walk keeps
+# stepping 20-day windows back and stops after a few empty or rejected ones.
+# Everything the stock reconstruction needs — buys, sells, and the assignment
+# share movements — lives in this feed, and a 58-day cap here is why every
+# stock sale from before the first sync was missing from realized P&L.
+TXN_LOOKBACK_DAYS = 400
 BACKFILL_WINDOW_DAYS = 20     # smaller windows = smaller, faster responses
 BACKFILL_MAX_WINDOWS = 40     # safety cap (~2 years)
 STOP_AFTER_EMPTY = 3          # stop backfill after this many empty windows
@@ -195,8 +201,16 @@ def backfill(c, sc, account_hash: str) -> tuple[list[dict[str, Any]], str | None
         try:
             orders = _orders_window(c, account_hash, from_dt, to_dt)
         except Exception as exc:
-            print(f"  stopped at {from_dt.date()} (API limit/error: {exc})")
-            break
+            # One bad window (timeout, transient 5xx) must not end the whole
+            # backfill: that silently dropped every order in the window — closes
+            # went missing and their puts were later booked as "expired". Skip it
+            # and keep walking; closed_trades also recovers any order that shows
+            # up in the transactions feed but not here.
+            print(f"  skipped {from_dt.date()} → {to_dt.date()} (API error: {exc})")
+            empty += 1
+            if empty >= STOP_AFTER_EMPTY:
+                break
+            continue
         kept = 0
         for o in orders:
             if not _is_executed(o):
@@ -285,6 +299,7 @@ def sync_txns(c, account_hash: str, existing: list[dict[str, Any]], deep: bool =
         return ordered, pulled
 
     w = 0
+    quiet = 0   # consecutive windows that came back empty or were rejected
     while True:
         to_dt = now - timedelta(days=BACKFILL_WINDOW_DAYS * w)
         from_dt = now - timedelta(days=min(BACKFILL_WINDOW_DAYS * (w + 1), TXN_LOOKBACK_DAYS))
@@ -301,8 +316,11 @@ def sync_txns(c, account_hash: str, existing: list[dict[str, Any]], deep: bool =
                 by_id[aid] = t
         pulled += len(txns)
         print(f"  txns {from_dt.date()} → {to_dt.date()}: {len(txns)}")
+        # Past the API's reach (rejected) or past the account's history (empty):
+        # a few quiet windows in a row and the walk is done.
+        quiet = quiet + 1 if not txns else 0
         w += 1
-        if BACKFILL_WINDOW_DAYS * w >= TXN_LOOKBACK_DAYS:
+        if quiet >= STOP_AFTER_EMPTY or BACKFILL_WINDOW_DAYS * w >= TXN_LOOKBACK_DAYS:
             break
     ordered = sorted(by_id.values(), key=lambda t: t.get("tradeDate") or t.get("time") or "")
     return ordered, pulled
