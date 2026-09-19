@@ -887,6 +887,10 @@ def build_from_history(
             print(f"  recovered {len(recovered)} option orders from the transactions feed")
             orders.extend(recovered)
         txn_order_ids = {t.get("orderId") for t in txns if t.get("orderId") is not None}
+        # Where each output list stood before this account, so everything it adds
+        # can be stamped with the account at the end of the loop.
+        _outputs = (csp_closed, leap_closed, spread_closed, covered_closed, stock_closed, unresolved)
+        _marks = [len(lst) for lst in _outputs]
 
         # PUT contracts assigned per (underlying, strike); we draw from this budget
         # to decide which expired short puts were assigned.
@@ -998,6 +1002,14 @@ def build_from_history(
                         "costPerShare": _round(float(cps), 4) if cps is not None else None,
                         "acquiredDate": acq or None,
                     })
+
+        # Stamp everything this account produced with its id — the same opaque hash
+        # the snapshot uses for the account — so the app can reconcile realized P&L
+        # against a broker report one account at a time. Schwab's reports are per
+        # account; an unstamped record can only be compared in aggregate.
+        for lst, start in zip(_outputs, _marks):
+            for rec in lst[start:]:
+                rec["accountId"] = aid
 
     # Fully user-added stock sales (predate the feed entirely, so they never show up
     # as orphans). Each is a closed long round-trip with a real acquired/sold date.
