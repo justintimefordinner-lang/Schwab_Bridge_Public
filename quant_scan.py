@@ -61,23 +61,23 @@ def _read_json(path: str, default):
         return default
 
 
-def _put_yield(bid: float, strike: float, dte: int) -> float:
-    """Premium as a share of the strike, scaled to yieldDays — the study's put_yield."""
-    return (bid / strike) * PARAMS["yieldDays"] / max(1, dte)
+def _put_yield(premium: float, strike: float, dte: int) -> float:
+    """Premium as a share of the strike, scaled to yieldDays — the study's put_yield, taken at the mid."""
+    return (premium / strike) * PARAMS["yieldDays"] / max(1, dte)
 
 
 def _contract(c: dict, strike: float, dte: int, exp: str, delta: float, spot: float) -> dict:
     bid = float(c.get("bid") or 0.0)
     ask = float(c.get("ask") or 0.0)
     mark = float(c.get("mark") or ((bid + ask) / 2 if ask else bid))
-    y = _put_yield(bid, strike, dte)
+    y = _put_yield(mark, strike, dte)  # at the mid, about where a working limit order fills
     return {
         "exp": exp, "dte": dte, "strike": round(strike, 2),
         "bid": round(bid, 2), "ask": round(ask, 2), "mark": round(mark, 2),
         "delta": round(delta, 3),
         "yield30": round(y * 100, 2),                       # % of strike per 30 days, at the mid
-        "annPct": round((bid / strike) * 365 / max(1, dte) * 100, 1),
-        "premium": round(bid * 100, 2),                     # $ per contract at the bid
+        "annPct": round((mark / strike) * 365 / max(1, dte) * 100, 1),
+        "premium": round(mark * 100, 2),                    # $ per contract at the mid
         "collateral": round(strike * 100, 2),
         "oi": int(c.get("openInterest") or 0),
         "volume": int(c.get("totalVolume") or 0),
