@@ -58,6 +58,13 @@ except Exception as _report_refresh_exc:  # noqa: BLE001
     report_refresh = None
     print(f"[auto_push] report_refresh unavailable: {_report_refresh_exc}", flush=True)
 
+# App-triggered quant CSP scan (task_inbox/quant_scan) and its hourly schedule.
+try:
+    import quant_scan
+except Exception as _quant_exc:  # noqa: BLE001
+    quant_scan = None
+    print(f"[auto_push] quant_scan unavailable: {_quant_exc}", flush=True)
+
 try:
     from zoneinfo import ZoneInfo
     _ET = ZoneInfo("America/New_York")
@@ -132,6 +139,7 @@ _ENV_KEY_FOR_LABEL = {
     "research": "RESEARCH_PUSH_INTERVAL",
     "am_report": "AM_REPORT_PUSH_INTERVAL",
     "am_ladder": "AM_LADDER_PUSH_INTERVAL",
+    "quant": "QUANT_PUSH_INTERVAL",
     "manual": "MANUAL_PUSH_INTERVAL",
 }
 
@@ -161,6 +169,7 @@ def main() -> None:
     am_report_interval = _interval("AM_REPORT_PUSH_INTERVAL", 1800)
     am_ladder_interval = _interval("AM_LADDER_PUSH_INTERVAL", 300)
     manual_interval = _interval("MANUAL_PUSH_INTERVAL", app_interval)
+    quant_interval = _interval("QUANT_PUSH_INTERVAL", 3600)
 
     # Each target: [label, callable, interval_seconds, next_run_epoch].
     targets: list[list] = []
@@ -194,6 +203,10 @@ def main() -> None:
         # (puts-only chains, no candles/trend/gamma). Cheap enough for a few minutes.
         import am_report as _amr
         targets.append(["am_ladder", _amr.refresh_ladders, am_ladder_interval, 0.0])
+    if quant_interval > 0 and quant_scan is not None:
+        # The wheel study's 4%-target put rule over the approved list (one chain call
+        # per name). Hourly during the session; it skips itself when the market is closed.
+        targets.append(["quant", quant_scan.main, quant_interval, 0.0])
 
     if not targets:
         raise SystemExit(
@@ -254,6 +267,13 @@ def main() -> None:
                     report_refresh.process(_log)
                 except Exception as exc:  # noqa: BLE001
                     _log(f"report_refresh: error — {exc}")
+
+            # Service an app-triggered quant scan (write-only).
+            if quant_scan is not None:
+                try:
+                    quant_scan.process(_log)
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"quant_scan: error — {exc}")
 
             # Daily post-open forced run (e.g. 9:40 ET). Fires once per trading day
             # within the catch window. _run_window() is active only on trading days
