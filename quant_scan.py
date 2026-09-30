@@ -3,7 +3,7 @@ quant_scan.py — the wheel study's put-selection rule, run against live chains.
 
 The QuantConnect study (2022–2026 backtests, 2023 hold-out) settled on one rule
 that was better than or equal to the baseline in every period: sell the
-LOWEST-delta put whose premium pays at least 4% of the strike per 30 days,
+LOWEST-delta put whose premium (at the mid) pays at least 4% of the strike per 30 days,
 never above 0.35 delta, choosing across every expiration 28–45 days out. The
 edge is in skipping underpaid names, not in the delta itself.
 
@@ -75,7 +75,7 @@ def _contract(c: dict, strike: float, dte: int, exp: str, delta: float, spot: fl
         "exp": exp, "dte": dte, "strike": round(strike, 2),
         "bid": round(bid, 2), "ask": round(ask, 2), "mark": round(mark, 2),
         "delta": round(delta, 3),
-        "yield30": round(y * 100, 2),                       # % of strike per 30 days
+        "yield30": round(y * 100, 2),                       # % of strike per 30 days, at the mid
         "annPct": round((bid / strike) * 365 / max(1, dte) * 100, 1),
         "premium": round(bid * 100, 2),                     # $ per contract at the bid
         "collateral": round(strike * 100, 2),
