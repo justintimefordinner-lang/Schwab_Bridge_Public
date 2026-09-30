@@ -966,6 +966,9 @@ def main(force: bool = False) -> None:
                  "earningsLoaded": bool(earnings), "params": CONFIG},
         "regime": regime,
         "board": board,
+        # Every scored name, fails and all, so other screens (the quant scan) can
+        # rank the whole approved list by this score rather than only the board.
+        "screened": scored,
         "movers": movers,
         "vrpGroups": vrp_heatmap(scored),
         "landmines": landmines,
