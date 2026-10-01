@@ -256,6 +256,15 @@ def main() -> None:
     history = ex.load_history(data_dir)
     today = date.today().isoformat()
     prices_as_of = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    # Covered-call ladders for 100+ share lots, so the Quant pages and the trader
+    # can pick a call for manual holdings too. Same cache the Schwab export keeps.
+    try:
+        with open(os.path.join(data_dir, ex.COVERED_CALL_CACHE_FILE), encoding="utf-8") as f:
+            cc_cache = json.load(f)
+    except Exception:
+        cc_cache = {}
+    cc_now = datetime.now().timestamp()
+    cc_market_open = ex._cc_market_open()
 
     app_accounts: list[dict[str, Any]] = []
     data_by_account: dict[str, dict[str, Any]] = {}
@@ -333,10 +342,19 @@ def main() -> None:
             "options": opts,
             "valueHistory": points,
         }
+        try:
+            ex._enrich_covered_calls(sc, c, data_by_account[acct_id], cc_cache, cc_now, cc_market_open)
+        except Exception as exc:
+            print(f"  note: covered-call ladders skipped for {acct.get('label')} ({exc}).")
         print(f"manual: {acct.get('label')} — {len(equities)} stocks, {len(opts)} options, "
               f"{sum(1 for o in options if greeks.get(o['occ'], {}).get('mark') is not None)} contracts quoted")
 
     snapshot = ex.build_snapshot(app_accounts, data_by_account, prices_as_of)
+    try:
+        with open(os.path.join(data_dir, ex.COVERED_CALL_CACHE_FILE), "w", encoding="utf-8") as f:
+            json.dump(cc_cache, f)
+    except Exception:
+        pass
     os.makedirs(out_dir, exist_ok=True)
     tmp = out_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
