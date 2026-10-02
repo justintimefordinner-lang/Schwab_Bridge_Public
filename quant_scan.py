@@ -34,18 +34,69 @@ STATUS_FILE = "quant-status.json"
 INBOX_DIR = "task_inbox"
 SCAN_MARKER = os.path.join(INBOX_DIR, "quant_scan")
 
-# The rule, as backtested (combo 87 / "4% target"). Overridable from .env.
-PARAMS = {
-    "targetYield": float(os.environ.get("QUANT_TARGET_YIELD", "0.04")),  # of strike, per yieldDays
-    "yieldDays": int(os.environ.get("QUANT_YIELD_DAYS", "30")),
-    "maxDelta": float(os.environ.get("QUANT_MAX_DELTA", "0.35")),
-    "expMin": int(os.environ.get("QUANT_EXP_MIN", "28")),
-    "expMax": int(os.environ.get("QUANT_EXP_MAX", "45")),
+# The rule, as backtested (combo 87 / "4% target"). The trader always follows
+# this one: every row carries its pick as `study`.
+STUDY = {
+    "targetYield": 0.04,       # of strike, per yieldDays
+    "yieldDays": 30,
+    "maxDelta": 0.35,
+    "expMin": 28,
+    "expMax": 45,
     "closeAtPct": 50,          # the study kept closing at 50% of the credit
     "maxPerTicker": 0.10,      # of buying power; one contract may overshoot to
     "tickerBand": 0.05,        #   maxPerTicker + tickerBand when adding
 }
+# What the dashboard's Quant page shows: the study's values, overridable from
+# .env, and on top of that the user's choices from the page's Settings
+# (data/quant-settings.json), re-read at the start of every scan.
+PARAMS = {
+    **STUDY,
+    "targetYield": float(os.environ.get("QUANT_TARGET_YIELD", STUDY["targetYield"])),
+    "yieldDays": int(os.environ.get("QUANT_YIELD_DAYS", STUDY["yieldDays"])),
+    "maxDelta": float(os.environ.get("QUANT_MAX_DELTA", STUDY["maxDelta"])),
+    "expMin": int(os.environ.get("QUANT_EXP_MIN", STUDY["expMin"])),
+    "expMax": int(os.environ.get("QUANT_EXP_MAX", STUDY["expMax"])),
+}
+_ENV_PARAMS = dict(PARAMS)
+SETTINGS_FILE = "quant-settings.json"
+_RANGES = {"targetYield": (0.005, 0.2), "yieldDays": (7, 90), "maxDelta": (0.05, 0.6), "expMin": (1, 180), "expMax": (1, 180),
+           "closeAtPct": (10, 95), "maxPerTicker": (0.01, 0.5), "tickerBand": (0.0, 0.25)}
 CHAIN_PAUSE_SEC = 0.5  # Schwab allows ~120 calls/min; stay well under
+
+
+def load_settings(data_dir: str) -> bool:
+    """Apply the dashboard's Quant settings on top of the .env defaults. Values out
+    of range are ignored one by one. Returns True when PARAMS differ from STUDY."""
+    raw = _read_json(os.path.join(data_dir, SETTINGS_FILE), None)
+    merged = dict(_ENV_PARAMS)
+    if isinstance(raw, dict):
+        for k, (lo, hi) in _RANGES.items():
+            v = raw.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi:
+                merged[k] = int(round(v)) if k in ("yieldDays", "expMin", "expMax", "closeAtPct") else float(v)
+    if merged["expMin"] > merged["expMax"]:
+        merged["expMin"], merged["expMax"] = _ENV_PARAMS["expMin"], _ENV_PARAMS["expMax"]
+    PARAMS.clear()
+    PARAMS.update(merged)
+    return PARAMS != STUDY
+
+
+def _choose(candidates: list[dict], params: dict) -> tuple[dict | None, dict | None]:
+    """The rule under `params`: among puts inside its expiry window and under its
+    delta cap, the lowest delta paying the target (ties to the higher yield); the
+    richest contract is the closest miss. Yields are re-scaled to its yieldDays."""
+    inwin = []
+    for k in candidates:
+        if not (params["expMin"] <= k["dte"] <= params["expMax"]) or k["delta"] > params["maxDelta"]:
+            continue
+        y = (k["mark"] / k["strike"]) * params["yieldDays"] / max(1, k["dte"]) * 100 if k["strike"] else 0.0
+        inwin.append({**k, "yield30": round(y, 2)})
+    if not inwin:
+        return None, None
+    best = max(inwin, key=lambda k: k["yield30"])
+    paying = [k for k in inwin if k["yield30"] >= params["targetYield"] * 100]
+    pick = min(paying, key=lambda k: (k["delta"], -k["yield30"])) if paying else None
+    return pick, best
 
 
 def _data_dir() -> str:
@@ -102,7 +153,7 @@ def scan_symbol(c, sym: str, earnings: dict) -> dict:
         except ValueError:
             pass
 
-    chain = sc.get_option_chain(c, sym, days=PARAMS["expMax"] + 1, strike_count=60, puts_only=True)
+    chain = sc.get_option_chain(c, sym, days=max(PARAMS["expMax"], STUDY["expMax"]) + 1, strike_count=60, puts_only=True)
     if not chain:
         return row
     spot = chain.get("underlyingPrice") or (chain.get("underlying") or {}).get("last")
@@ -118,8 +169,8 @@ def scan_symbol(c, sym: str, earnings: dict) -> dict:
             dte = (date.fromisoformat(exp) - today).days
         except ValueError:
             continue
-        if not (PARAMS["expMin"] <= dte <= PARAMS["expMax"]):
-            continue
+        if not (min(PARAMS["expMin"], STUDY["expMin"]) <= dte <= max(PARAMS["expMax"], STUDY["expMax"])):
+            continue  # wide enough for both rules; _choose narrows per rule
         for strike_s, lst in strikes.items():
             cdata = lst[0] if isinstance(lst, list) and lst else None
             if not isinstance(cdata, dict):
@@ -129,21 +180,20 @@ def scan_symbol(c, sym: str, earnings: dict) -> dict:
             if bid <= 0 or strike >= spot:
                 continue
             dl = am_report._put_delta(cdata, strike, spot, dte)   # Schwab's delta, else from IV
-            if dl is None or abs(dl) > PARAMS["maxDelta"]:
+            if dl is None or abs(dl) > max(PARAMS["maxDelta"], STUDY["maxDelta"]):
                 continue
             candidates.append(_contract(cdata, strike, dte, exp, abs(dl), spot))
 
     if not candidates:
         row["reason"] = "no_puts"
         return row
-    paying = [k for k in candidates if k["yield30"] >= PARAMS["targetYield"] * 100]
-    # The richest contract under the cap is the "closest miss" when nothing pays.
-    row["best"] = max(candidates, key=lambda k: k["yield30"])
-    if not paying:
+    pick, best = _choose(candidates, PARAMS)
+    row["best"] = best  # the closest miss when nothing pays
+    # The backtest's rule, always, for the trader (the same put when the settings are the study's).
+    row["study"] = pick if PARAMS == STUDY else _choose(candidates, STUDY)[0]
+    if not pick:
         row["reason"] = "low"
         return row
-    # Lowest delta first, then the higher yield: the study's tie-break.
-    pick = min(paying, key=lambda k: (k["delta"], -k["yield30"]))
     row["pick"] = pick
     row["reason"] = "ok"
     if row["erDays"] is not None:
@@ -157,6 +207,7 @@ def scan(force: bool = False) -> dict:
     from research_sync import load_approved
 
     data_dir = _data_dir()
+    custom = load_settings(data_dir)
     is_open, _ = am_report._market_status()
     out_path = os.path.join(data_dir, OUT_FILE)
     if not force and is_open is False and os.path.exists(out_path):
@@ -185,6 +236,8 @@ def scan(force: bool = False) -> dict:
             "universe": len(approved),
             "qualifying": sum(1 for r in rows if r["pick"]),
             "params": PARAMS,
+            "study": STUDY,
+            "custom": custom,
             "source": "schwab-bridge",
             "elapsedSec": round(time.time() - t0, 1),
         },
