@@ -4,8 +4,9 @@ quant_scan.py — the wheel study's put-selection rule, run against live chains.
 The QuantConnect study (2022–2026 backtests, 2023 hold-out) settled on one rule
 that was better than or equal to the baseline in every period: sell the
 LOWEST-delta put whose premium (at the mid) pays at least 4% of the strike per 30 days,
-never above 0.35 delta, choosing across every expiration 28–45 days out. The
-edge is in skipping underpaid names, not in the delta itself.
+never above 0.35 delta, in the expiration closest to 35 days (28–42 days out). The
+edge is in skipping underpaid names, not in the delta itself. (Searching every
+expiration 28–45 days out was also backtested and did slightly worse.)
 
 This module applies exactly that rule to every approved ticker and writes
 APP_DATA_DIR/quant-scan.json: for each name, the contract the rule would sell
@@ -41,7 +42,8 @@ STUDY = {
     "yieldDays": 30,
     "maxDelta": 0.35,
     "expMin": 28,
-    "expMax": 45,
+    "expMax": 42,
+    "expTarget": 35,           # use the expiration closest to this; 0 = best put across the window
     "closeAtPct": 50,          # the study kept closing at 50% of the credit
     "maxPerTicker": 0.10,      # of buying power; one contract may overshoot to
     "tickerBand": 0.05,        #   maxPerTicker + tickerBand when adding
@@ -56,10 +58,11 @@ PARAMS = {
     "maxDelta": float(os.environ.get("QUANT_MAX_DELTA", STUDY["maxDelta"])),
     "expMin": int(os.environ.get("QUANT_EXP_MIN", STUDY["expMin"])),
     "expMax": int(os.environ.get("QUANT_EXP_MAX", STUDY["expMax"])),
+    "expTarget": int(os.environ.get("QUANT_EXP_TARGET", STUDY["expTarget"])),
 }
 _ENV_PARAMS = dict(PARAMS)
 SETTINGS_FILE = "quant-settings.json"
-_RANGES = {"targetYield": (0.005, 0.2), "yieldDays": (7, 90), "maxDelta": (0.05, 0.6), "expMin": (1, 180), "expMax": (1, 180),
+_RANGES = {"targetYield": (0.005, 0.2), "yieldDays": (7, 90), "maxDelta": (0.05, 0.6), "expMin": (1, 180), "expMax": (1, 180), "expTarget": (0, 180),
            "closeAtPct": (10, 95), "maxPerTicker": (0.01, 0.5), "tickerBand": (0.0, 0.25)}
 CHAIN_PAUSE_SEC = 0.5  # Schwab allows ~120 calls/min; stay well under
 
@@ -73,7 +76,7 @@ def load_settings(data_dir: str) -> bool:
         for k, (lo, hi) in _RANGES.items():
             v = raw.get(k)
             if isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi:
-                merged[k] = int(round(v)) if k in ("yieldDays", "expMin", "expMax", "closeAtPct") else float(v)
+                merged[k] = int(round(v)) if k in ("yieldDays", "expMin", "expMax", "expTarget", "closeAtPct") else float(v)
     if merged["expMin"] > merged["expMax"]:
         merged["expMin"], merged["expMax"] = _ENV_PARAMS["expMin"], _ENV_PARAMS["expMax"]
     PARAMS.clear()
@@ -82,12 +85,18 @@ def load_settings(data_dir: str) -> bool:
 
 
 def _choose(candidates: list[dict], params: dict) -> tuple[dict | None, dict | None]:
-    """The rule under `params`: among puts inside its expiry window and under its
-    delta cap, the lowest delta paying the target (ties to the higher yield); the
-    richest contract is the closest miss. Yields are re-scaled to its yieldDays."""
+    """The rule under `params`: in the expiration closest to expTarget days (any
+    expiration in the window when expTarget is 0), among puts under the delta cap,
+    the lowest delta paying the target (ties to the higher yield); the richest
+    contract is the closest miss. Yields are re-scaled to its yieldDays."""
+    window = [k for k in candidates if params["expMin"] <= k["dte"] <= params["expMax"]]
+    target = params.get("expTarget") or 0
+    if target and window:
+        near = min({k["dte"] for k in window}, key=lambda d: (abs(d - target), d))
+        window = [k for k in window if k["dte"] == near]
     inwin = []
-    for k in candidates:
-        if not (params["expMin"] <= k["dte"] <= params["expMax"]) or k["delta"] > params["maxDelta"]:
+    for k in window:
+        if k["delta"] > params["maxDelta"]:
             continue
         y = (k["mark"] / k["strike"]) * params["yieldDays"] / max(1, k["dte"]) * 100 if k["strike"] else 0.0
         inwin.append({**k, "yield30": round(y, 2)})
