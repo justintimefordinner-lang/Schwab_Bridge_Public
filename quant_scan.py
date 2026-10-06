@@ -3,10 +3,16 @@ quant_scan.py — the wheel study's put-selection rule, run against live chains.
 
 The QuantConnect study (2022–2026 backtests, 2023 hold-out) settled on one rule
 that was better than or equal to the baseline in every period: sell the
-LOWEST-delta put whose premium (at the mid) pays at least 4% of the strike per 30 days,
+LOWEST-delta put whose premium pays at least 4% of the strike per 30 days,
 never above 0.35 delta, in the expiration closest to 35 days (28–42 days out). The
 edge is in skipping underpaid names, not in the delta itself. (Searching every
 expiration 28–45 days out was also backtested and did slightly worse.)
+
+The premium is judged at the price a working limit order can expect, which
+depends on how wide the quote is (FILL_BANDS): the midpoint when the spread is
+up to 10% of the mid, a quarter of the way from the bid toward the ask at 10–30%,
+and the bid itself above 30%. The backtest judged and filled at the bid everywhere;
+quotes wider than maxSpread (50%) are skipped as not real.
 
 This module applies exactly that rule to every approved ticker and writes
 APP_DATA_DIR/quant-scan.json: for each name, the contract the rule would sell
@@ -67,6 +73,19 @@ SETTINGS_FILE = "quant-settings.json"
 _RANGES = {"targetYield": (0.005, 0.2), "yieldDays": (7, 90), "maxDelta": (0.05, 0.6), "expMin": (1, 180), "expMax": (1, 180), "expTarget": (0, 180), "maxSpread": (0.05, 9.99),
            "closeAtPct": (10, 95), "maxPerTicker": (0.01, 0.5), "tickerBand": (0.0, 0.25)}
 CHAIN_PAUSE_SEC = 0.5  # Schwab allows ~120 calls/min; stay well under
+# Assumed fill as a position between bid (0) and ask (1), by spread as % of the mid.
+FILL_BANDS = ((10.0, 0.5, "mid"), (30.0, 0.25, "quarter"), (float("inf"), 0.0, "bid"))
+
+
+def _fill_price(bid: float, ask: float, mark: float) -> tuple[float, str, float | None]:
+    """(assumed fill, band name, spread % of mid). No ask: the bid is all there is."""
+    if ask <= 0 or mark <= 0:
+        return bid, "bid", None
+    spread_pct = (ask - bid) / mark * 100
+    for top, pos, name in FILL_BANDS:
+        if spread_pct <= top:
+            return round(bid + pos * (ask - bid), 4), name, round(spread_pct, 1)
+    return bid, "bid", round(spread_pct, 1)
 
 
 def load_settings(data_dir: str) -> bool:
@@ -100,7 +119,7 @@ def _choose(candidates: list[dict], params: dict) -> tuple[dict | None, dict | N
     for k in window:
         if k["delta"] > params["maxDelta"]:
             continue
-        y = (k["mark"] / k["strike"]) * params["yieldDays"] / max(1, k["dte"]) * 100 if k["strike"] else 0.0
+        y = (k["fill"] / k["strike"]) * params["yieldDays"] / max(1, k["dte"]) * 100 if k["strike"] else 0.0
         inwin.append({**k, "yield30": round(y, 2)})
     if not inwin:
         return None, None
@@ -124,7 +143,7 @@ def _read_json(path: str, default):
 
 
 def _put_yield(premium: float, strike: float, dte: int) -> float:
-    """Premium as a share of the strike, scaled to yieldDays — the study's put_yield, taken at the mid."""
+    """Premium as a share of the strike, scaled to yieldDays — the study's put_yield, at the assumed fill."""
     return (premium / strike) * PARAMS["yieldDays"] / max(1, dte)
 
 
@@ -132,18 +151,20 @@ def _contract(c: dict, strike: float, dte: int, exp: str, delta: float, spot: fl
     bid = float(c.get("bid") or 0.0)
     ask = float(c.get("ask") or 0.0)
     mark = float(c.get("mark") or ((bid + ask) / 2 if ask else bid))
-    y = _put_yield(mark, strike, dte)  # at the mid, about where a working limit order fills
+    fill, basis, spread_pct = _fill_price(bid, ask, mark)
+    y = _put_yield(fill, strike, dte)  # at the assumed fill for this spread band
     return {
         "exp": exp, "dte": dte, "strike": round(strike, 2),
         "bid": round(bid, 2), "ask": round(ask, 2), "mark": round(mark, 2),
+        "fill": round(fill, 2), "basis": basis,               # the price the yield is judged at, and why
         "delta": round(delta, 3),
-        "yield30": round(y * 100, 2),                       # % of strike per 30 days, at the mid
-        "annPct": round((mark / strike) * 365 / max(1, dte) * 100, 1),
-        "premium": round(mark * 100, 2),                    # $ per contract at the mid
+        "yield30": round(y * 100, 2),                       # % of strike per 30 days, at the fill
+        "annPct": round((fill / strike) * 365 / max(1, dte) * 100, 1),
+        "premium": round(fill * 100, 2),                    # $ per contract at the fill
         "collateral": round(strike * 100, 2),
         "oi": int(c.get("openInterest") or 0),
         "volume": int(c.get("totalVolume") or 0),
-        "spreadPct": round(((ask - bid) / mark) * 100, 1) if mark and ask else None,
+        "spreadPct": spread_pct,
         "iv": round(float(c.get("volatility") or 0) / 100, 4) or None,
         "belowSpotPct": round((1 - strike / spot) * 100, 1) if spot else None,
     }
