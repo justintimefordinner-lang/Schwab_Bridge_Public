@@ -44,6 +44,7 @@ STUDY = {
     "expMin": 28,
     "expMax": 42,
     "expTarget": 35,           # use the expiration closest to this; 0 = best put across the window
+    "maxSpread": 0.50,         # (ask - bid) / mid above this: not a real quote, skipped (backtested: neutral at 50%, tighter costs)
     "closeAtPct": 50,          # the study kept closing at 50% of the credit
     "maxPerTicker": 0.10,      # of buying power; one contract may overshoot to
     "tickerBand": 0.05,        #   maxPerTicker + tickerBand when adding
@@ -59,10 +60,11 @@ PARAMS = {
     "expMin": int(os.environ.get("QUANT_EXP_MIN", STUDY["expMin"])),
     "expMax": int(os.environ.get("QUANT_EXP_MAX", STUDY["expMax"])),
     "expTarget": int(os.environ.get("QUANT_EXP_TARGET", STUDY["expTarget"])),
+    "maxSpread": float(os.environ.get("QUANT_MAX_SPREAD", STUDY["maxSpread"])),
 }
 _ENV_PARAMS = dict(PARAMS)
 SETTINGS_FILE = "quant-settings.json"
-_RANGES = {"targetYield": (0.005, 0.2), "yieldDays": (7, 90), "maxDelta": (0.05, 0.6), "expMin": (1, 180), "expMax": (1, 180), "expTarget": (0, 180),
+_RANGES = {"targetYield": (0.005, 0.2), "yieldDays": (7, 90), "maxDelta": (0.05, 0.6), "expMin": (1, 180), "expMax": (1, 180), "expTarget": (0, 180), "maxSpread": (0.05, 9.99),
            "closeAtPct": (10, 95), "maxPerTicker": (0.01, 0.5), "tickerBand": (0.0, 0.25)}
 CHAIN_PAUSE_SEC = 0.5  # Schwab allows ~120 calls/min; stay well under
 
@@ -193,13 +195,19 @@ def scan_symbol(c, sym: str, earnings: dict) -> dict:
                 continue
             candidates.append(_contract(cdata, strike, dte, exp, abs(dl), spot))
 
+    # Quotes too wide to trust: the mid of a 143%-spread put is not a price anyone pays.
+    all_cands = candidates
+    wide = [k for k in candidates if (k.get("spreadPct") or 0) > PARAMS["maxSpread"] * 100]
+    candidates = [k for k in candidates if k not in wide]
+    row["wide"] = len(wide)
+    # The backtest's rule, always, for the trader (the same put when the settings are the study's).
+    study_cands = candidates if PARAMS["maxSpread"] == STUDY["maxSpread"] else [k for k in all_cands if (k.get("spreadPct") or 0) <= STUDY["maxSpread"] * 100]
+    row["study"] = _choose(study_cands, STUDY)[0] if study_cands else None
     if not candidates:
-        row["reason"] = "no_puts"
+        row["reason"] = "wide" if wide else "no_puts"
         return row
     pick, best = _choose(candidates, PARAMS)
     row["best"] = best  # the closest miss when nothing pays
-    # The backtest's rule, always, for the trader (the same put when the settings are the study's).
-    row["study"] = pick if PARAMS == STUDY else _choose(candidates, STUDY)[0]
     if not pick:
         row["reason"] = "low"
         return row
