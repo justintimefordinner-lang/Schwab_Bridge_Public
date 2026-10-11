@@ -170,9 +170,15 @@ def main() -> None:
     am_ladder_interval = _interval("AM_LADDER_PUSH_INTERVAL", 300)
     manual_interval = _interval("MANUAL_PUSH_INTERVAL", app_interval)
     quant_interval = _interval("QUANT_PUSH_INTERVAL", 3600)
+    pace_interval = _interval("PACE_PUSH_INTERVAL", 3600)
 
     # Each target: [label, callable, interval_seconds, next_run_epoch].
     targets: list[list] = []
+    if pace_interval > 0:
+        # The book against a benchmark bought with the same money on the same days
+        # (pace_car.py): one price-history call plus a light cash-flow pull. Hourly.
+        import pace_car
+        targets.append(["pace", pace_car.main, pace_interval, 0.0])
     if app_interval > 0:
         import export_to_app
         targets.append(["app", export_to_app.main, app_interval, 0.0])
