@@ -114,6 +114,14 @@ def _log(msg: str) -> None:
 _LAST_RUN: dict = {}
 
 
+def _looks_auth(exc) -> bool:
+    """An AuthError, or anything that reads like a dead token. The app shows a calm
+    "Login needed" badge for these instead of a red "failed"."""
+    low = (str(exc) or "").lower()
+    return (exc.__class__.__name__ == "AuthError" or "invalid_grant" in low or "token" in low
+            or "expired" in low or "re-authenticate" in low)
+
+
 def _run(label: str, fn) -> tuple[float, object]:
     """Run one export. Never raises — a failure in one target must not stop
     the loop or block the other target. Returns (elapsed seconds, fn result)."""
@@ -324,8 +332,22 @@ def main() -> None:
                     else:
                         used = interval
                     t[3] = time.time() + used  # schedule the next run
-                    status[label] = {"lastAt": _iso(time.time()), "nextAt": _iso(t[3]),
-                                     "intervalSec": used}
+                    # Every run stamps lastAttemptAt; lastAt moves only when the data did.
+                    # A failure carries its message so the app can say "failed 4m ago"
+                    # (or "Login needed") instead of quietly looking a bit stale.
+                    _ok, _exc = _LAST_RUN.get(label, (True, None))
+                    entry = dict(status.get(label) or {})
+                    entry.update({"lastAttemptAt": _iso(time.time()), "nextAt": _iso(t[3]), "intervalSec": used})
+                    if _ok:
+                        entry["lastAt"] = entry["lastAttemptAt"]
+                        entry["status"] = "ok"
+                        entry.pop("error", None)
+                    elif isinstance(_exc, SystemExit):
+                        pass  # a deliberate skip (market closed, feed not set up): not a failure, clears nothing
+                    else:
+                        entry["status"] = "login_required" if _looks_auth(_exc) else "error"
+                        entry["error"] = (str(_exc) or _exc.__class__.__name__)[:300]
+                    status[label] = entry
             if ran_any:
                 _write_status(status)
             time.sleep(TICK_SECONDS)
