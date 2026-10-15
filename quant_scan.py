@@ -239,10 +239,10 @@ def scan_symbol(c, sym: str, earnings: dict) -> dict:
     return row
 
 
-# The trader's portfolio hedge (backtested 2026-10-14): QQQ puts ~10% below spot,
+# The trader's portfolio hedge (backtested 2026-10-14): SMH puts ~10% below spot (QQQ did less for a chip-heavy book),
 # 6-12 months out. The scan carries the put side of that chain so the trader can
 # pick the contract without a chain call of its own.
-HEDGE_SYM = "QQQ"
+HEDGE_SYM = os.environ.get("HEDGE_SYM", "SMH").strip().upper() or "SMH"
 HEDGE_DTE = (150, 372)
 HEDGE_STRIKE_BAND = (0.72, 0.97)   # strike as a share of spot
 
@@ -337,7 +337,7 @@ def scan(force: bool = False) -> dict:
             "elapsedSec": round(time.time() - t0, 1),
         },
         "rows": rows,
-        "hedge": hedge,   # the QQQ put side for the trader's portfolio hedge
+        "hedge": hedge,   # the put side of HEDGE_SYM for the trader's portfolio hedge
     }
     tmp = out_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
