@@ -239,6 +239,57 @@ def scan_symbol(c, sym: str, earnings: dict) -> dict:
     return row
 
 
+# The trader's portfolio hedge (backtested 2026-10-14): QQQ puts ~10% below spot,
+# 6-12 months out. The scan carries the put side of that chain so the trader can
+# pick the contract without a chain call of its own.
+HEDGE_SYM = "QQQ"
+HEDGE_DTE = (150, 372)
+HEDGE_STRIKE_BAND = (0.72, 0.97)   # strike as a share of spot
+
+
+def hedge_chain(c) -> dict | None:
+    """{"sym", "price", "puts": [...]} for the hedge, or None when the chain is unavailable."""
+    import schwab_client as sc
+
+    try:
+        chain = sc.get_option_chain(c, HEDGE_SYM, days=HEDGE_DTE[1], strike_count=60, puts_only=True)
+    except Exception:  # noqa: BLE001
+        chain = None
+    if not chain:
+        return None
+    spot = chain.get("underlyingPrice") or (chain.get("underlying") or {}).get("last")
+    spot = float(spot) if spot else None
+    if not spot:
+        return None
+    today = date.today()
+    puts: list[dict] = []
+    for exp_key, strikes in (chain.get("putExpDateMap") or {}).items():
+        exp = exp_key.split(":")[0]
+        try:
+            dte = (date.fromisoformat(exp) - today).days
+        except ValueError:
+            continue
+        if not (HEDGE_DTE[0] <= dte <= HEDGE_DTE[1]):
+            continue
+        for strike_s, lst in strikes.items():
+            cdata = lst[0] if isinstance(lst, list) and lst else None
+            if not isinstance(cdata, dict):
+                continue
+            strike = float(strike_s)
+            ask = float(cdata.get("ask") or 0.0)
+            if ask <= 0 or not (HEDGE_STRIKE_BAND[0] * spot <= strike <= HEDGE_STRIKE_BAND[1] * spot):
+                continue
+            bid = float(cdata.get("bid") or 0.0)
+            delta = cdata.get("delta")
+            puts.append({"exp": exp, "dte": dte, "strike": round(strike, 2), "bid": round(bid, 2), "ask": round(ask, 2),
+                         "mark": round(float(cdata.get("mark") or (bid + ask) / 2), 2),
+                         "delta": round(float(delta), 3) if isinstance(delta, (int, float)) else None,
+                         "oi": int(cdata.get("openInterest") or 0),
+                         "belowSpotPct": round((1 - strike / spot) * 100, 1)})
+    puts.sort(key=lambda p: (p["dte"], p["strike"]))
+    return {"sym": HEDGE_SYM, "price": round(spot, 2), "puts": puts}
+
+
 def scan(force: bool = False) -> dict:
     import am_report
     import schwab_client as sc
@@ -265,6 +316,12 @@ def scan(force: bool = False) -> dict:
                          "erDate": earnings.get(sym), "erDays": None, "erInWindow": False})
         time.sleep(CHAIN_PAUSE_SEC)
 
+    try:
+        hedge = hedge_chain(c)
+    except Exception as exc:  # noqa: BLE001 — the hedge chain must not sink the scan
+        print(f"quant scan: hedge chain failed ({exc})")
+        hedge = None
+
     # Picks first, richest yield at the top; then the rest by how close they came.
     rows.sort(key=lambda r: (r["pick"] is None, -(r["pick"] or r["best"] or {}).get("yield30", 0)))
     payload = {
@@ -280,6 +337,7 @@ def scan(force: bool = False) -> dict:
             "elapsedSec": round(time.time() - t0, 1),
         },
         "rows": rows,
+        "hedge": hedge,   # the QQQ put side for the trader's portfolio hedge
     }
     tmp = out_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
