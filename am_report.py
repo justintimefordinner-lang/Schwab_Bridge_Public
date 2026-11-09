@@ -277,6 +277,45 @@ def trend_metrics(closes: list[float]) -> dict | None:
             "pctAbove200": round(pct_above_200, 1), "strength": round(strength, 1)}
 
 
+def ema(values: list[float], n: int) -> float | None:
+    """Exponential moving average (standard 2/(n+1) smoothing, SMA seed). None under 2n values."""
+    if len(values) < 2 * n:
+        return None
+    k = 2.0 / (n + 1)
+    e = sum(values[:n]) / n
+    for v in values[n:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def weekly_closes(candles: list[dict]) -> list[float]:
+    """Each ISO week's last close, oldest first (a partial current week counts as a week)."""
+    by_week: dict[tuple[int, int], float] = {}
+    for k in candles:
+        ts, close = k.get("datetime"), k.get("close")
+        if ts is None or close is None:
+            continue
+        iso = datetime.utcfromtimestamp(ts / 1000.0).isocalendar()
+        by_week[(iso[0], iso[1])] = float(close)
+    return [by_week[w] for w in sorted(by_week)]
+
+
+def ema_clouds(candles: list[dict]) -> dict:
+    """The social-media "EMA cloud" read: the 8 EMA above the 21 EMA on the daily
+    bars and again on the weekly bars. Information only — backtested as an entry
+    gate on the wheel (2026-11-08) it cut the return from 47.6% to 32.0% a year and
+    made the drawdown worse, because the clouds turn red exactly when the wheel
+    does its best work. None where the history is too short to say."""
+    closes = closes_of(candles)
+    weekly = weekly_closes(candles)
+    d8, d21 = ema(closes, 8), ema(closes, 21)
+    w8, w21 = ema(weekly, 8), ema(weekly, 21)
+    daily = (d8 > d21) if d8 is not None and d21 is not None else None
+    week = (w8 > w21) if w8 is not None and w21 is not None else None
+    green = (daily and week) if daily is not None and week is not None else None
+    return {"daily": daily, "weekly": week, "green": green}
+
+
 def beta_vs(closes: list[float], spy: list[float]) -> float | None:
     n = min(len(closes), len(spy), 252)
     if n < 60:
@@ -530,6 +569,7 @@ def screen(sym: str, candles: list[dict], spy: list[float], chain: dict | None,
     tm = trend_metrics(closes)
     if not tm:
         return {"sym": sym, "skip": True, "fails": ["insufficient history"]}
+    tm["clouds"] = ema_clouds(candles)   # shown on the Quant page, never a gate
 
     move = (closes[-1] / closes[-2] - 1) * 100 if len(closes) >= 2 and closes[-2] else None
     rv_vol = rel_vol(volumes_of(candles))
